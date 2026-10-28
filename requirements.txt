@@ -1,2 +1,2 @@
 python-telegram-bot==22.8
-sqlite3
+python-dotenv==1.0.1
