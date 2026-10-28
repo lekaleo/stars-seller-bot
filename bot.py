@@ -1,8 +1,10 @@
 import os
 import re
 import html
-import bisect
+import json
 import time
+import bisect
+import asyncio
 import logging
 import sqlite3
 
@@ -57,10 +59,10 @@ SBP_PAYMENT_URL = os.getenv("SBP_PAYMENT_URL", "https://pay.platega.io/sbp_place
 CARD_PAYMENT_URL = os.getenv("CARD_PAYMENT_URL", "https://pay.platega.io/card_placeholder")
 CRYPTO_PAYMENT_URL = os.getenv("CRYPTO_PAYMENT_URL", "https://t.me/send?start=crypto_placeholder")
 
-# Fragment (автовыдача звёзд) — переменные для будущей автоматизации
-FRAGMENT_API_URL = os.getenv("FRAGMENT_API_URL", "https://fragment.com/api")
-FRAGMENT_API_KEY = (os.getenv("FRAGMENT_API_KEY") or "").strip()
-FRAGMENT_WALLET_COOKIE = (os.getenv("FRAGMENT_WALLET_COOKIE") or "").strip()
+# Fragment (автовыдача звёзд): доступ задаётся в /admin → 🤖 Автовыдача Fragment
+# (settings: fragment_api_key / fragment_hash / fragment_cookies / fragment_ton_mnemonic)
+# либо переменными окружения FRAGMENT_API_KEY / FRAGMENT_HASH / FRAGMENT_COOKIES.
+# Значения читаются через fragment_conf() — код и дефолты от них не зависят.
 
 # === Настройки ===
 DEFAULT_RATE = 1.4  # курс по умолчанию: 1.4₽ за одну звезду (меняется в админке)
@@ -253,9 +255,9 @@ def get_message_html_with_custom_emojis(message) -> str:
 
 # === Редактируемые названия кнопок (ШАГ 2) ===
 BUTTON_DEFAULTS = {
-    'btn_main_stars': "⭐️ Звёзды",
-    'btn_main_premium': "⭐️ Telegram Premium",
-    'btn_main_reviews': "💬 Отзывы",
+    'btn_main_stars': "Звёзды",
+    'btn_main_premium': "Telegram Premium",
+    'btn_main_reviews': "Отзывы",
     'btn_stars_100': "🌟 100 звёзд ({price}₽)",
     'btn_stars_1000': "🌟 1000 звёзд ({price}₽)",
     'btn_stars_10000': "🌟 10000 звёзд ({price}₽)",
@@ -266,6 +268,13 @@ BUTTON_DEFAULTS = {
     'btn_pay_card': "💳 Банковская карта (РФ)",
     'btn_pay_crypto': "💎 Криптовалюта (USDT / TON / BTC)",
     'btn_reviews_url': "📢 Перейти к отзывам",
+}
+
+# Премиум-иконки кнопок (рисуются нативно через icon_custom_emoji_id)
+BUTTON_ICON_DEFAULTS = {
+    'btn_main_stars': '5936259309812846957',    # Премиум ⭐️
+    'btn_main_premium': '6039402906476613311',  # Премиум ⭐️
+    'btn_main_reviews': '5793933761594789855',  # Премиум 💬
 }
 
 BUTTON_TITLES = {
@@ -300,6 +309,54 @@ def btn_label(key: str, **variables) -> str:
     return label
 
 
+def btn_icon(key: str):
+    """ID Премиум-эмодзи для кнопки: настройка btn_icon_<key> -> BUTTON_ICON_DEFAULTS.
+    Пустая строка в настройке означает «без иконки» (None)."""
+    val = get_setting('btn_icon_' + key)
+    if val is None:
+        return BUTTON_ICON_DEFAULTS.get(key)
+    val = str(val).strip()
+    return val or None
+
+
+def make_btn(key: str, callback_data=None, url=None, **variables) -> InlineKeyboardButton:
+    """Кнопка с названием и Премиум-иконкой (icon_custom_emoji_id, PTB 22.x)."""
+    label = btn_label(key, **variables)
+    icon_id = btn_icon(key)
+    kwargs = {}
+    if callback_data is not None:
+        kwargs['callback_data'] = callback_data
+    if url is not None:
+        kwargs['url'] = url
+    if icon_id:
+        try:
+            return InlineKeyboardButton(text=label, icon_custom_emoji_id=icon_id, **kwargs)
+        except TypeError:  # старая версия PTB без поддержки иконок
+            logger.warning("PTB не поддерживает icon_custom_emoji_id — кнопка '%s' без иконки", key)
+    return InlineKeyboardButton(text=label, **kwargs)
+
+
+def extract_button_label_and_icon(message):
+    """Разбирает сообщение владельца: (чистый текст кнопки, id Премиум-эмодзи или None).
+    Фолбэк-символ Премиум-эмодзи вырезается из текста, чтобы не дублировать смайлик."""
+    text = message.text or message.caption or ""
+    entities = message.entities or message.caption_entities or []
+    icon_id = None
+    clean = text
+    for e in entities:
+        if e.type == 'custom_emoji' and getattr(e, 'custom_emoji_id', None):
+            icon_id = str(e.custom_emoji_id)
+            offsets = _utf16_offsets(text)
+            start = bisect.bisect_left(offsets, e.offset)
+            end = bisect.bisect_left(offsets, e.offset + e.length)
+            start = max(0, min(start, len(text)))
+            end = max(0, min(end, len(text)))
+            clean = (text[:start] + text[end:]).strip()
+            break
+    clean = re.sub(r'<[^>]+>', '', clean).strip()
+    return clean, icon_id
+
+
 def get_rate() -> float:
     """Текущий курс из таблицы settings (ключ star_rate), иначе DEFAULT_RATE."""
     raw = get_setting('star_rate')
@@ -325,9 +382,9 @@ def main_text() -> str:
 
 def main_keyboard():
     return [
-        [InlineKeyboardButton(btn_label('btn_main_stars'), callback_data='catalog_stars')],
-        [InlineKeyboardButton(btn_label('btn_main_premium'), callback_data='catalog_premium')],
-        [InlineKeyboardButton(btn_label('btn_main_reviews'), callback_data='reviews')]
+        [make_btn('btn_main_stars', callback_data='catalog_stars')],
+        [make_btn('btn_main_premium', callback_data='catalog_premium')],
+        [make_btn('btn_main_reviews', callback_data='reviews')]
     ]
 
 
@@ -448,6 +505,41 @@ def connect_db():
 # БД используется для истории заказов; settings — лишь необязательный кэш правок админа.
 # Если БД пуста/удалена/недоступна, бот стартует и работает на константах из кода.
 _SETTINGS_CACHE = {}  # оперативные правки админа в памяти (когда БД недоступна)
+SETTINGS_BACKUP_FILE = os.path.join(BASE_DIR, "settings_backup.json")
+
+
+def _save_settings_backup():
+    """Дублирует все настройки в settings_backup.json (переживает очистку БД и контейнера)."""
+    try:
+        data = {}
+        try:
+            conn = connect_db()
+            c = conn.cursor()
+            c.execute("SELECT key, value FROM settings")
+            for row in c.fetchall():
+                data[str(row[0])] = row[1]
+            conn.close()
+        except Exception as exc:
+            logger.warning("Бэкап настроек: БД недоступна (%s) — сохраняю кэш памяти", exc)
+        data.update(_SETTINGS_CACHE)  # свежие правки важнее
+        tmp = SETTINGS_BACKUP_FILE + ".tmp"
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, SETTINGS_BACKUP_FILE)
+    except OSError as exc:
+        logger.warning("Не удалось записать %s: %s", SETTINGS_BACKUP_FILE, exc)
+
+
+def _load_settings_backup() -> dict:
+    try:
+        with open(SETTINGS_BACKUP_FILE, encoding='utf-8') as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError) as exc:
+        logger.warning("Не удалось прочитать %s: %s", SETTINGS_BACKUP_FILE, exc)
+        return {}
 
 
 def init_db():
@@ -468,6 +560,24 @@ def init_db():
         except Exception:
             conn.rollback()  # колонка уже существует (SQLite/PostgreSQL)
         conn.commit()
+
+        # Восстановление настроек из JSON, если БД пустая/стёрлась
+        backup = _load_settings_backup()
+        restored = 0
+        for k, v in backup.items():
+            if get_setting(k) is None:
+                _SETTINGS_CACHE[str(k)] = v
+                try:
+                    c.execute(
+                        "INSERT INTO settings (key, value) VALUES (?, ?) "
+                        "ON CONFLICT(key) DO UPDATE SET value = excluded.value", (k, v))
+                    restored += 1
+                except Exception:
+                    conn.rollback()
+        if restored:
+            conn.commit()
+            logger.info("Настройки восстановлены из settings_backup.json: %s", restored)
+
         conn.close()
         logger.info("База данных инициализирована: %s",
                     "PostgreSQL" if DB_IS_POSTGRES else DB_NAME)
@@ -490,9 +600,11 @@ def set_setting(key, value):
         )
         conn.commit()
         conn.close()
+        _save_settings_backup()
         return True
     except Exception as exc:
         logger.error("Не удалось сохранить настройку '%s' в БД: %s (держим в памяти)", key, exc)
+        _save_settings_backup()
         return False
 
 
@@ -519,9 +631,11 @@ def delete_setting(key):
         c.execute("DELETE FROM settings WHERE key = ?", (key,))
         conn.commit()
         conn.close()
+        _save_settings_backup()
         return True
     except Exception as exc:
         logger.error("Не удалось удалить настройку '%s': %s", key, exc)
+        _save_settings_backup()
         return False
 
 
@@ -591,6 +705,9 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         'adm_texts_menu': admin_texts_menu,
         'adm_buttons_menu': admin_buttons_menu,
         'adm_pay_links': admin_pay_links,
+        'adm_fragment': admin_fragment,
+        'adm_fragment_mode': admin_fragment_mode,
+        'adm_fragment_clear': admin_fragment_clear,
         'adm_back': admin_back,
     }
 
@@ -631,6 +748,16 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         key = data.split('adm_btn_', 1)[1]
         if key in BUTTON_DEFAULTS:
             await admin_edit_button(query, context, key)
+            return
+    elif data.startswith('adm_setpay_'):
+        pay_type = data.split('adm_setpay_', 1)[1]
+        if pay_type in PAY_TYPES:
+            await admin_setpay(query, context, pay_type)
+            return
+    elif data.startswith('adm_fragment_set_'):
+        field = data.split('adm_fragment_set_', 1)[1]
+        if field in FRAGMENT_FIELDS:
+            await admin_fragment_prompt(query, context, field)
             return
 
     handler = handlers.get(data)
@@ -773,43 +900,98 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if key not in BUTTON_DEFAULTS:
             context.user_data['state'] = ''
             return
-        # Названия кнопок — чистый текст: Telegram не поддерживает <tg-emoji> в кнопках
-        new_label = re.sub(r'<[^>]+>', '', text_in).strip()
-        if not new_label:
+
+        # Владелец просто шлёт текст с Премиум-эмодзи (или обычным смайликом) —
+        # эмодзи становится нативной иконкой кнопки icon_custom_emoji_id,
+        # а его фолбэк-символ вырезается из текста, чтобы не дублироваться.
+        clean_label, icon_id = extract_button_label_and_icon(update.message)
+        if not clean_label and not icon_id:
             await update.message.reply_text("❌ Отправьте текстовое сообщение.")
             return
+
+        if icon_id:
+            set_setting('btn_icon_' + key, icon_id)
+            new_label = clean_label or BUTTON_DEFAULTS[key]
+        else:
+            set_setting('btn_icon_' + key, '')
+            new_label = clean_label or BUTTON_DEFAULTS[key]
+
         saved_ok = set_setting('btn_' + key, new_label)
         context.user_data['state'] = ''
-        logger.info("Админ %s обновил название кнопки '%s': %s", user.id, key, new_label)
+        logger.info(
+            "Админ %s обновил кнопку '%s': текст=%r, icon_custom_emoji_id=%s",
+            user.id, key, new_label, icon_id or '(нет)')
+
         warn = "" if saved_ok else (
             "\n\n⚠️ БД недоступна: название применено сейчас, но после перезапуска "
             "вернётся дефолт из кода.")
         await update.message.reply_text(
-            f"✅ <b>Название кнопки «{BUTTON_TITLES[key]}» обновлено!</b>\n\n"
-            f"Новое название: {html.escape(new_label)}" + warn,
+            f"✅ <b>Кнопка «{BUTTON_TITLES[key]}» обновлена!</b>\n\n"
+            f"Текст: {html.escape(new_label)}\n"
+            f"Премиум-иконка: {'есть' if icon_id else 'обычный смайлик'}" + warn,
             parse_mode='HTML'
         )
+        # Сразу показываем живую кнопку с Премиум-эмодзи
+        try:
+            await update.message.reply_text(
+                "👇 Так кнопка выглядит теперь:",
+                reply_markup=InlineKeyboardMarkup([[make_btn(key, callback_data='back')]])
+            )
+        except Exception as exc:
+            logger.warning("Не удалось показать тестовую кнопку '%s': %s", key, exc)
 
     elif state == 'WAIT_PAY_URL':
         if user.id != ADMIN_ID:
             await update.message.reply_text("⛔ Нет прав.")
             return
-        parts = text_in.split(maxsplit=1)
-        if len(parts) != 2 or parts[0] not in ('1', '2', '3') or not parts[1].startswith('http'):
-            await update.message.reply_text(
-                "❌ Неверный формат. Пример:\n<code>1 https://pay.example.ru/sbp</code>",
-                parse_mode='HTML'
-            )
+        pay_type = context.user_data.get('pay_type')
+        names = {'sbp': 'СБП', 'card': 'Карта РФ', 'crypto': 'Криптовалюта'}
+        if pay_type not in names:
+            context.user_data['state'] = ''
+            await update.message.reply_text("❌ Не выбран способ оплаты — откройте /admin.")
             return
-        keys = {'1': 'sbp_url', '2': 'card_url', '3': 'crypto_url'}
-        names = {'1': 'СБП', '2': 'карта РФ', '3': 'криптовалюта'}
-        key = keys[parts[0]]
-        set_setting(key, parts[1].strip())
+        link = text_in.strip()
+        if not link.startswith('http'):
+            await update.message.reply_text(
+                "❌ Ссылка должна начинаться с https://\nПопробуйте ещё раз:")
+            return
+        set_setting(f'{pay_type}_url', link)
         context.user_data['state'] = ''
-        logger.info("Админ %s обновил ссылку оплаты %s: %s", user.id, key, parts[1])
+        context.user_data.pop('pay_type', None)
+        logger.info("Админ %s обновил ссылку оплаты %s: %s", user.id, pay_type, link)
         await update.message.reply_text(
-            f"✅ <b>Ссылка для «{names[parts[0]]}» обновлена!</b>\n\n<code>{parts[1]}</code>",
+            f"✅ <b>Ссылка для «{names[pay_type]}» обновлена!</b>\n\n<code>{html.escape(link)}</code>",
             parse_mode='HTML'
+        )
+
+    elif state == 'WAIT_FRAGMENT_VALUE':
+        if user.id != ADMIN_ID:
+            await update.message.reply_text("⛔ Нет прав.")
+            return
+        field = context.user_data.get('fragment_field')
+        if field not in FRAGMENT_FIELDS:
+            context.user_data['state'] = ''
+            await update.message.reply_text(
+                "❌ Параметр не выбран — откройте /admin → 🤖 Автовыдача Fragment.")
+            return
+        value = text_in.strip()
+        if not value:
+            await update.message.reply_text("❌ Пустое значение. Отправьте текст ещё раз:")
+            return
+
+        setting_key, title = FRAGMENT_FIELDS[field]
+        set_setting(setting_key, value)
+        context.user_data['state'] = ''
+        context.user_data.pop('fragment_field', None)
+        logger.info("Админ %s задал Fragment-параметр %s (значение скрыто)", user.id, setting_key)
+
+        await update.message.reply_text(
+            f"✅ <b>{title} — сохранено</b>\n\n"
+            f"Значение: <code>{_mask(value)}</code>",
+            parse_mode='HTML',
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🤖 К автовыдаче Fragment", callback_data='adm_fragment')
+            ]])
         )
 
     elif state == 'WAIT_STARS':
@@ -841,9 +1023,9 @@ async def show_star_options(query_or_update, context):
     username = context.user_data.get('recipient', '@----')
     rate = get_rate()
     keyboard = [
-        [InlineKeyboardButton(btn_label('btn_stars_100', price=f'{round(100 * rate, 2):g}'), callback_data='stars_100')],
-        [InlineKeyboardButton(btn_label('btn_stars_1000', price=f'{round(1000 * rate, 2):g}'), callback_data='stars_1000')],
-        [InlineKeyboardButton(btn_label('btn_stars_10000', price=f'{round(10000 * rate, 2):g}'), callback_data='stars_10000')],
+        [make_btn('btn_stars_100', callback_data='stars_100', price=f'{round(100 * rate, 2):g}')],
+        [make_btn('btn_stars_1000', callback_data='stars_1000', price=f'{round(1000 * rate, 2):g}')],
+        [make_btn('btn_stars_10000', callback_data='stars_10000', price=f'{round(10000 * rate, 2):g}')],
         [InlineKeyboardButton("🔙 Назад", callback_data='back')]
     ]
 
@@ -956,9 +1138,9 @@ async def show_premium_prompt(query, context):
 async def show_premium_tariffs(query_or_update, context):
     username = context.user_data.get('recipient', '@----')
     keyboard = [
-        [InlineKeyboardButton(btn_label('btn_prem_3'), callback_data='prem_3_1390')],
-        [InlineKeyboardButton(btn_label('btn_prem_6'), callback_data='prem_6_1850')],
-        [InlineKeyboardButton(btn_label('btn_prem_12'), callback_data='prem_12_3190')],
+        [make_btn('btn_prem_3', callback_data='prem_3_1390')],
+        [make_btn('btn_prem_6', callback_data='prem_6_1850')],
+        [make_btn('btn_prem_12', callback_data='prem_12_3190')],
         [InlineKeyboardButton("🔙 Назад", callback_data='back')]
     ]
 
@@ -1024,7 +1206,7 @@ async def select_premium(query, context, months, price):
 async def show_reviews(query, context):
     text = screen_text('reviews_text')
     keyboard = [
-        [InlineKeyboardButton(btn_label('btn_reviews_url'), url=REVIEWS_LINK)],
+        [make_btn('btn_reviews_url', url=REVIEWS_LINK)],
         [InlineKeyboardButton("🔙 Назад", callback_data='back')]
     ]
     await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
@@ -1048,9 +1230,9 @@ async def show_payment(query, context):
     text = screen_text('payment_menu', order_id=order_id, item_title=item_title, total=f'{total:g}')
 
     keyboard = [
-        [InlineKeyboardButton(btn_label('btn_pay_sbp'), callback_data='payment_sbp')],
-        [InlineKeyboardButton(btn_label('btn_pay_card'), callback_data='payment_card')],
-        [InlineKeyboardButton(btn_label('btn_pay_crypto'), callback_data='payment_crypto')],
+        [make_btn('btn_pay_sbp', callback_data='payment_sbp')],
+        [make_btn('btn_pay_card', callback_data='payment_card')],
+        [make_btn('btn_pay_crypto', callback_data='payment_crypto')],
         [InlineKeyboardButton("🔙 Назад", callback_data='back')]
     ]
     await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
@@ -1229,76 +1411,200 @@ async def customer_paid(query, context, order_id):
 
 
 # === Админ: подтвердить / отклонить ===
-# === Fragment: автоматическая покупка звёзд (заготовка под автовыдачу) ===
+# === Fragment: автоматическая покупка звёзд ===
+FRAGMENT_TIMEOUT = 25
+FRAGMENT_API_DEFAULT = "https://fragment.com/api"
+
+
+def _fragment_endpoint(frag_hash: str = "") -> str:
+    """URL Fragment API: из настроек/окружения либо стандартный, с ?hash= если он задан."""
+    base = (get_setting('fragment_api_url')
+            or os.getenv('FRAGMENT_API_URL')
+            or FRAGMENT_API_DEFAULT).strip().rstrip('/')
+    if not base.startswith('http'):
+        base = FRAGMENT_API_DEFAULT
+    if frag_hash:
+        from urllib.parse import quote as _quote
+        base = f"{base}{'&' if '?' in base else '?'}hash={_quote(frag_hash)}"
+    return base
+
+
+def _fragment_post(url: str, form: dict, cookies: str = "") -> dict:
+    """POST-запрос к Fragment (form-urlencoded, как это делает их веб-клиент)."""
+    import urllib.parse as _urlparse
+    import urllib.request as _urlreq
+
+    body = _urlparse.urlencode(form).encode('utf-8')
+    headers = {
+        'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+        'Accept': 'application/json, text/javascript, */*; q=0.01',
+        'X-Requested-With': 'XMLHttpRequest',
+        'Origin': 'https://fragment.com',
+        'Referer': 'https://fragment.com/stars/buy',
+        'User-Agent': ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+                       '(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'),
+    }
+    if cookies:
+        headers['Cookie'] = cookies
+    request = _urlreq.Request(url, data=body, headers=headers, method='POST')
+    with _urlreq.urlopen(request, timeout=FRAGMENT_TIMEOUT) as response:
+        raw = response.read().decode('utf-8', errors='replace')
+    return json.loads(raw) if raw.strip() else {}
+
+
+def _fragment_buy_via_api(recipient: str, stars: int, api_key: str) -> dict:
+    """Способ А: внешний API-сервис автовыдачи (ключ FRAGMENT_API_KEY / настройка в /admin)."""
+    import urllib.request as _urlreq
+
+    username = recipient.lstrip('@')
+    payload = json.dumps({
+        'recipient': username,
+        'username': username,
+        'quantity': stars,
+        'amount': stars,
+    }).encode('utf-8')
+    request = _urlreq.Request(
+        _fragment_endpoint(),
+        data=payload,
+        headers={
+            'Content-Type': 'application/json',
+            'Accept': 'application/json',
+            'X-API-Key': api_key,
+            'Authorization': f'Bearer {api_key}',
+        },
+        method='POST',
+    )
+    with _urlreq.urlopen(request, timeout=FRAGMENT_TIMEOUT) as response:
+        raw = response.read().decode('utf-8', errors='replace')
+    data = json.loads(raw) if raw.strip() else {}
+
+    tx_id = (data.get('tx_id') or data.get('transaction_id') or data.get('id')
+             or (data.get('data') or {}).get('tx_id'))
+    if data.get('ok') or data.get('success') or tx_id:
+        logger.info("Fragment autobuy (API): %s ⭐ для %s — успех, tx=%s",
+                    stars, recipient, tx_id)
+        return {"success": True, "tx_id": str(tx_id or ''), "link": data.get('link', '')}
+
+    error = data.get('error') or data.get('message') or raw[:300]
+    logger.error("Fragment autobuy (API): отказ для %s (%s ⭐): %s", recipient, stars, error)
+    return {"success": False, "error": str(error)}
+
+
+def _fragment_buy_direct(recipient: str, stars: int, frag_hash: str, cookies: str) -> dict:
+    """Способ Б: прямой 3-шаговый поток fragment.com/api?hash=<hash>."""
+    url = _fragment_endpoint(frag_hash)
+    username = recipient.lstrip('@')
+
+    # Шаг 1: поиск получателя
+    step1 = _fragment_post(url, {
+        'method': 'searchStarsRecipient',
+        'query': username,
+        'quantity': stars,
+        'mode': 'receiver',
+    }, cookies)
+    found = step1.get('found') or {}
+    recipient_id = (found.get('recipient') or found.get('id')
+                    or step1.get('recipient') or (step1.get('data') or {}).get('recipient'))
+    if not recipient_id:
+        error = step1.get('error') or step1.get('message') or f"получатель @{username} не найден"
+        logger.error("Fragment autobuy (direct): шаг 1 не удался для @%s: %s", username, error)
+        return {"success": False, "error": f"Поиск получателя: {error}"}
+
+    # Шаг 2: создание запроса на покупку
+    step2 = _fragment_post(url, {
+        'method': 'initBuyStarsRequest',
+        'recipient': recipient_id,
+        'quantity': stars,
+    }, cookies)
+    req_id = (step2.get('req_id') or step2.get('id')
+              or (step2.get('request') or {}).get('id')
+              or (step2.get('data') or {}).get('req_id'))
+    if not req_id:
+        error = step2.get('error') or step2.get('message') or "не удалось создать запрос на покупку"
+        logger.error("Fragment autobuy (direct): шаг 2 не удался для @%s: %s", username, error)
+        return {"success": False, "error": f"Создание запроса: {error}"}
+
+    # Шаг 3: получение ссылки на оплату TON
+    step3 = _fragment_post(url, {
+        'method': 'getBuyStarsLink',
+        'account': recipient_id,
+        'transaction': 1,
+        'id': req_id,
+    }, cookies)
+    transaction = step3.get('transaction') or {}
+    link = (step3.get('link') or transaction.get('link')
+            or (step3.get('data') or {}).get('link') or '')
+    tx_id = link or req_id
+
+    if not (step3.get('ok') or step3.get('success') or link or step3.get('transaction')):
+        error = step3.get('error') or step3.get('message') or "Fragment не вернул данные транзакции"
+        logger.error("Fragment autobuy (direct): шаг 3 не удался для @%s: %s", username, error)
+        return {"success": False, "error": f"Транзакция: {error}"}
+
+    logger.info("Fragment autobuy (direct): %s ⭐ для @%s — запрос создан, tx=%s",
+                stars, username, tx_id)
+    return {"success": True, "tx_id": str(tx_id), "link": link,
+            "needs_payment": bool(link)}
+
+
 async def fragment_auto_buy(recipient_username: str, stars_amount: int) -> dict:
-    """Автоматически отправляет звёзды получателю через Fragment.
+    """Автоматическая отправка звёзд получателю через Fragment.
 
-    Возвращает словарь:
-        {"success": True,  "tx_id": "..."}
-        {"success": False, "error": "..."}
+    Возвращает:
+        {"success": True,  "tx_id": "...", "link": "..."}   — покупка/транзакция создана
+        {"success": False, "error": "..."}                  — автовыдача не выполнена
 
-    Сейчас это каркас: реальная интеграция требует авторизованной сессии кошелька
-    Fragment (FRAGMENT_WALLET_COOKIE) либо ключа API (FRAGMENT_API_KEY).
-    Пока переменные не заданы — функция честно сообщает, что автовыдача не настроена,
-    и админ выдаёт заказ вручную.
+    Конфигурация читается сначала из /admin (таблица settings), затем из окружения:
+        fragment_api_key        / FRAGMENT_API_KEY         — способ А (API-сервис);
+        fragment_hash           / FRAGMENT_HASH            — способ Б (hash fragment.com/api?hash=);
+        fragment_cookies        / FRAGMENT_COOKIES         — способ Б (Cookie сессии);
+        fragment_ton_mnemonic   / FRAGMENT_TON_MNEMONIC    — кошелёк для оплаты TON;
+        fragment_mode           = 'auto' | 'manual'        — режим работы.
+
+    Если доступ не настроен или включён ручной режим — честно сообщает об этом,
+    и админ выдаёт заказ вручную (бот не падает).
     """
-    recipient_username = (recipient_username or "").strip()
+    recipient_username = (recipient_username or '').strip()
+    if recipient_username and not recipient_username.startswith('@'):
+        recipient_username = '@' + recipient_username
+
     try:
         stars_amount = int(stars_amount)
     except (TypeError, ValueError):
         return {"success": False, "error": f"Некорректное количество звёзд: {stars_amount!r}"}
 
-    if not recipient_username.startswith('@') or not USERNAME_RE.match(recipient_username):
+    if not recipient_username or not USERNAME_RE.match(recipient_username):
         return {"success": False, "error": f"Некорректный @username: {recipient_username!r}"}
     if stars_amount <= 0:
         return {"success": False, "error": "Количество звёзд должно быть больше нуля"}
 
-    if not FRAGMENT_API_KEY and not FRAGMENT_WALLET_COOKIE:
-        logger.warning(
-            "Fragment autobuy: автовыдача не настроена (нет FRAGMENT_API_KEY/FRAGMENT_WALLET_COOKIE) — "
-            "заказ %s ⭐ для %s нужно выдать вручную", stars_amount, recipient_username)
-        return {"success": False, "error": "Автовыдача не настроена (нет доступа к Fragment)"}
+    mode = (get_setting('fragment_mode') or 'auto').strip().lower()
+    if mode == 'manual':
+        logger.info("Fragment autobuy: ручной режим — заказ %s ⭐ для %s выдаётся вручную",
+                    stars_amount, recipient_username)
+        return {"success": False, "error": "Включён ручной режим автовыдачи"}
 
-    payload = {
-        "recipient": recipient_username,
-        "amount": stars_amount,
-        "currency": "TON",      # Fragment продаёт звёзды за TON
-        "method": "buy_stars",
-    }
-    headers = {"Content-Type": "application/json"}
-    if FRAGMENT_API_KEY:
-        headers["X-API-Key"] = FRAGMENT_API_KEY
-    if FRAGMENT_WALLET_COOKIE:
-        headers["Cookie"] = FRAGMENT_WALLET_COOKIE
+    api_key = fragment_conf('api_key')
+    frag_hash = fragment_conf('hash')
+    cookies = fragment_conf('cookies')
+
+    if not api_key and not (frag_hash and cookies):
+        logger.warning(
+            "Fragment autobuy: доступ не настроен (нет API-ключа либо hash+cookie) — "
+            "%s ⭐ для %s выдаётся вручную", stars_amount, recipient_username)
+        return {"success": False,
+                "error": "Автовыдача не настроена — задайте её в /admin → 🤖 Автовыдача Fragment"}
 
     try:
-        import json as _json
-        import urllib.request as _urlreq
-
-        request = _urlreq.Request(
-            FRAGMENT_API_URL,
-            data=_json.dumps(payload).encode('utf-8'),
-            headers=headers,
-            method='POST',
-        )
-        with _urlreq.urlopen(request, timeout=25) as response:
-            raw = response.read().decode('utf-8', errors='replace')
-        data = _json.loads(raw) if raw else {}
-
-        tx_id = data.get('tx_id') or data.get('transaction_id') or data.get('id')
-        if data.get('ok') or data.get('success') or tx_id:
-            logger.info("Fragment autobuy: %s ⭐ для %s — успех, tx=%s",
-                        stars_amount, recipient_username, tx_id)
-            return {"success": True, "tx_id": str(tx_id or '')}
-
-        error = data.get('error') or data.get('message') or raw[:300]
-        logger.error("Fragment autobuy: отказ для %s (%s ⭐): %s",
-                     recipient_username, stars_amount, error)
-        return {"success": False, "error": str(error)}
+        if api_key:
+            return await asyncio.to_thread(
+                _fragment_buy_via_api, recipient_username, stars_amount, api_key)
+        return await asyncio.to_thread(
+            _fragment_buy_direct, recipient_username, stars_amount, frag_hash, cookies)
     except Exception as exc:
-        logger.exception("Fragment autobuy: ошибка запроса для %s: %s",
-                         recipient_username, exc)
+        logger.exception("Fragment autobuy: ошибка запроса для %s: %s", recipient_username, exc)
         return {"success": False, "error": f"{type(exc).__name__}: {exc}"}
+
 
 
 async def admin_approve(query, context, order_id):
@@ -1333,6 +1639,10 @@ async def admin_approve(query, context, order_id):
         if result.get('success'):
             tx_id = html.escape(str(result.get('tx_id') or '—'))
             autobuy_line = f"✅ Автовыдача Fragment: успешно (tx: <code>{tx_id}</code>)"
+            link = str(result.get('link') or '')
+            if link:
+                autobuy_line += (f"\n💎 Ссылка на оплату TON:\n"
+                                 f"<code>{html.escape(link)}</code>")
         else:
             error = html.escape(str(result.get('error') or 'неизвестная ошибка'))
             autobuy_line = (f"⚠️ Автовыдача не выполнена: <i>{error}</i>\n"
@@ -1402,6 +1712,7 @@ def admin_menu_keyboard():
         [InlineKeyboardButton("📝 Редактор текстов (Все экраны)", callback_data='adm_texts_menu')],
         [InlineKeyboardButton("🔘 Изменить названия кнопок (Блоков)", callback_data='adm_buttons_menu')],
         [InlineKeyboardButton("💳 Настроить ссылки оплаты", callback_data='adm_pay_links')],
+        [InlineKeyboardButton("🤖 Автовыдача Fragment", callback_data='adm_fragment')],
         [InlineKeyboardButton("✨ Премиум-эмодзи в меню", callback_data='adm_emoji')]
     ]
 
@@ -1701,14 +2012,17 @@ async def admin_edit_button(query, context, key):
     saved = get_setting('btn_' + key)
     current = btn_label(key)  # уже очищено от HTML-тегов — в кнопках теги недопустимы
     status = "✏️ изменено вами" if saved is not None else "стандартное"
-    vars_hint = f"\n\n<b>Переменные:</b> <code>{BUTTON_VARS[key]}</code>" if key in BUTTON_VARS else ""
+    icon_now = "есть" if btn_icon(key) else "обычный текст/смайлик"
+    vars_hint = f"\n<b>Переменные:</b> <code>{BUTTON_VARS[key]}</code>" if key in BUTTON_VARS else ""
 
     await query.edit_message_text(
         f"🔘 <b>{BUTTON_TITLES[key]}</b>\n\n"
         f"<b>Текущее название</b> ({status}):\n"
-        f"{html.escape(current)}{vars_hint}\n\n"
-        "Отправьте в чат новое название кнопки (обычный текст + обычные эмодзи).\n"
-        "Премиум-эмодзи в кнопках Telegram не поддерживаются — теги будут вырезаны.",
+        f"{html.escape(current)}\n"
+        f"<b>Премиум-иконка:</b> {icon_now}{vars_hint}\n\n"
+        "Просто отправьте в чат новое название кнопки с любым Премиум-эмодзи "
+        "или обычным смайликом!\n"
+        "Премиум-эмодзи станет иконкой кнопки, обычный смайлик — просто частью текста.",
         reply_markup=InlineKeyboardMarkup([[
             InlineKeyboardButton("🔄 Сбросить название по умолчанию", callback_data=f'adm_btnrst_{key}')
         ], [
@@ -1724,11 +2038,14 @@ async def admin_button_reset(query, context, key):
         return
 
     delete_setting('btn_' + key)
+    delete_setting('btn_icon_' + key)
     context.user_data['state'] = ''
-    logger.info("Админ %s сбросил название кнопки '%s' на стандартное", query.from_user.id, key)
+    logger.info("Админ %s сбросил кнопку '%s' (текст + иконка) на стандарт",
+                query.from_user.id, key)
     await query.edit_message_text(
-        f"🔄 Название кнопки «{BUTTON_TITLES[key]}» сброшено на стандартное:\n"
-        f"{BUTTON_DEFAULTS[key]}",
+        f"🔄 Кнопка «{BUTTON_TITLES[key]}» сброшена на стандарт:\n"
+        f"Текст: {html.escape(BUTTON_DEFAULTS[key])}\n"
+        f"Иконка: {'премиум' if BUTTON_ICON_DEFAULTS.get(key) else 'без иконки'}",
         reply_markup=InlineKeyboardMarkup([[
             InlineKeyboardButton("🔙 К списку кнопок", callback_data='adm_buttons_menu')
         ]]),
@@ -1745,27 +2062,176 @@ async def admin_reset_text(query, context):
     await admin_text_reset(query, context, 'welcome')
 
 
+# === Оплата: только кнопки, без ввода цифр ===
+PAY_TYPES = {
+    'sbp': ('sbp_url', 'СБП', '💸'),
+    'card': ('card_url', 'Карта РФ', '💳'),
+    'crypto': ('crypto_url', 'Криптовалюта', '💎'),
+}
+
+
 async def admin_pay_links(query, context):
     if query.from_user.id != ADMIN_ID:
         await query.answer("⛔ Нет прав", show_alert=True)
         return
 
+    context.user_data['state'] = ''
+    context.user_data.pop('pay_type', None)
+
     sbp = get_payment_url('sbp_url', SBP_PAYMENT_URL)
     card = get_payment_url('card_url', CARD_PAYMENT_URL)
     crypto = get_payment_url('crypto_url', CRYPTO_PAYMENT_URL)
-    context.user_data['state'] = 'WAIT_PAY_URL'
 
     await query.edit_message_text(
         "💳 <b>Настройка ссылок оплаты</b>\n\n"
-        f"1️⃣ СБП: <code>{sbp}</code>\n"
-        f"2️⃣ Карта РФ: <code>{card}</code>\n"
-        f"3️⃣ Крипта: <code>{crypto}</code>\n\n"
-        "Отправьте в чат новую ссылку в формате:\n"
-        "<code>1 https://pay.example.ru/sbp</code>\n\n"
-        "Где 1 = СБП, 2 = карта РФ, 3 = крипта.",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data='adm_back')]]),
+        f"💸 СБП: <code>{html.escape(sbp)}</code>\n"
+        f"💳 Карта РФ: <code>{html.escape(card)}</code>\n"
+        f"💎 Крипта: <code>{html.escape(crypto)}</code>\n\n"
+        "Нажмите нужную кнопку — и отправьте новую ссылку сообщением (без цифр и кодов).",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("💸 Изменить ссылку СБП", callback_data='adm_setpay_sbp')],
+            [InlineKeyboardButton("💳 Изменить ссылку Карты РФ", callback_data='adm_setpay_card')],
+            [InlineKeyboardButton("💎 Изменить ссылку Крипты", callback_data='adm_setpay_crypto')],
+            [InlineKeyboardButton("🔙 Назад", callback_data='adm_back')],
+        ]),
         parse_mode='HTML'
     )
+
+
+async def admin_setpay(query, context, pay_type):
+    if query.from_user.id != ADMIN_ID:
+        await query.answer("⛔ Нет прав", show_alert=True)
+        return
+
+    key, title, emoji = PAY_TYPES[pay_type]
+    context.user_data['state'] = 'WAIT_PAY_URL'
+    context.user_data['pay_type'] = pay_type
+    current = get_payment_url(key, '')
+    logger.info("Админ %s выбрал изменение ссылки %s", query.from_user.id, key)
+
+    await query.edit_message_text(
+        f"{emoji} <b>Новая ссылка для «{title}»</b>\n\n"
+        f"Сейчас: <code>{html.escape(current or '— не задана —')}</code>\n\n"
+        "Отправьте в чат новую ссылку (начинающуюся с https://):",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("🔙 К ссылкам оплаты", callback_data='adm_pay_links')
+        ]]),
+        parse_mode='HTML'
+    )
+
+
+# === Fragment: настройки автовыдачи ===
+FRAGMENT_FIELDS = {
+    'api': ('fragment_api_key', 'API-ключ сервиса автовыдачи'),
+    'hash': ('fragment_hash', 'hash из Fragment (из ссылки fragment.com/api?hash=...)'),
+    'cookies': ('fragment_cookies', 'Cookie авторизованной сессии Fragment'),
+    'mnemonic': ('fragment_ton_mnemonic', 'TON-мнемоника кошелька'),
+}
+
+# Соответствие поля формы -> имя в fragment_conf()/переменных окружения
+FRAGMENT_CONF_NAMES = {
+    'api': 'api_key',
+    'hash': 'hash',
+    'cookies': 'cookies',
+    'mnemonic': 'ton_mnemonic',
+}
+
+
+def fragment_conf(name: str, default: str = "") -> str:
+    """Значение из /admin (settings), затем из переменных окружения, затем default."""
+    return (get_setting('fragment_' + name)
+            or os.getenv('FRAGMENT_' + name.upper())
+            or default or '').strip()
+
+
+def _mask(value: str) -> str:
+    if not value:
+        return "— не задано —"
+    return f"••••{value[-4:]}" if len(value) > 4 else "••••"
+
+
+async def admin_fragment(query, context):
+    if query.from_user.id != ADMIN_ID:
+        await query.answer("⛔ Нет прав", show_alert=True)
+        return
+
+    context.user_data['state'] = ''
+    mode = (get_setting('fragment_mode') or 'auto').strip()
+    mode_title = "Автоматический" if mode == 'auto' else "Ручной"
+    api_key = fragment_conf('api_key')
+    frag_hash = fragment_conf('hash')
+    cookies = fragment_conf('cookies')
+    mnemonic = fragment_conf('ton_mnemonic')
+
+    ready = bool(api_key or (frag_hash and cookies))
+    status = "🟢 Включена" if (mode == 'auto' and ready) else "🟡 Ручной режим"
+
+    await query.edit_message_text(
+        "🤖 <b>Автовыдача звёзд через Fragment</b>\n\n"
+        f"<b>Статус:</b> {status}\n"
+        f"<b>Режим:</b> {mode_title}\n\n"
+        f"🔑 API-ключ: <code>{_mask(api_key)}</code>\n"
+        f"🔗 hash: <code>{_mask(frag_hash)}</code>\n"
+        f"🍪 Cookie: <code>{_mask(cookies)}</code>\n"
+        f"🧩 TON-мнемоника: <code>{_mask(mnemonic)}</code>\n\n"
+        "Нажмите кнопку и отправьте значение сообщением — код вводить не нужно.",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton(
+                f"🔁 Режим: {'Автоматический' if mode == 'auto' else 'Ручной'}",
+                callback_data='adm_fragment_mode')],
+            [InlineKeyboardButton("🔑 Задать API-ключ", callback_data='adm_fragment_set_api')],
+            [InlineKeyboardButton("🔗 Задать hash Fragment", callback_data='adm_fragment_set_hash')],
+            [InlineKeyboardButton("🍪 Задать Cookie Fragment", callback_data='adm_fragment_set_cookies')],
+            [InlineKeyboardButton("🧩 Задать TON-мнемонику", callback_data='adm_fragment_set_mnemonic')],
+            [InlineKeyboardButton("🗑 Очистить ключи Fragment", callback_data='adm_fragment_clear')],
+            [InlineKeyboardButton("🔙 Назад", callback_data='adm_back')],
+        ]),
+        parse_mode='HTML'
+    )
+
+
+async def admin_fragment_mode(query, context):
+    if query.from_user.id != ADMIN_ID:
+        await query.answer("⛔ Нет прав", show_alert=True)
+        return
+    mode = (get_setting('fragment_mode') or 'auto').strip()
+    new_mode = 'manual' if mode == 'auto' else 'auto'
+    set_setting('fragment_mode', new_mode)
+    logger.info("Админ %s переключил режим Fragment на %s", query.from_user.id, new_mode)
+    await query.answer("Режим: " + ("Автоматический" if new_mode == 'auto' else "Ручной"))
+    await admin_fragment(query, context)
+
+
+async def admin_fragment_prompt(query, context, field):
+    if query.from_user.id != ADMIN_ID:
+        await query.answer("⛔ Нет прав", show_alert=True)
+        return
+
+    setting_key, title = FRAGMENT_FIELDS[field]
+    context.user_data['state'] = 'WAIT_FRAGMENT_VALUE'
+    context.user_data['fragment_field'] = field
+    current = fragment_conf(FRAGMENT_CONF_NAMES[field])
+
+    await query.edit_message_text(
+        f"🤖 <b>{title}</b>\n\n"
+        f"Сейчас: <code>{_mask(current)}</code>\n\n"
+        "Отправьте значение сообщением.",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("🔙 К автовыдаче", callback_data='adm_fragment')
+        ]]),
+        parse_mode='HTML'
+    )
+
+
+async def admin_fragment_clear(query, context):
+    if query.from_user.id != ADMIN_ID:
+        await query.answer("⛔ Нет прав", show_alert=True)
+        return
+    for setting_key, _ in FRAGMENT_FIELDS.values():
+        delete_setting(setting_key)
+    logger.info("Админ %s очистил ключи Fragment", query.from_user.id)
+    await query.answer("Ключи Fragment очищены")
+    await admin_fragment(query, context)
 
 
 # === Возврат в меню ===
@@ -1779,7 +2245,7 @@ async def back_to_menu(query, context):
 
 
 # === HealthCheck HTTP-сервер (для 24/7 бесплатного облачного хостинга) ===
-BOT_VERSION = "2026-10-28.3"
+BOT_VERSION = "2026-10-28.4"
 
 
 class HealthCheckHandler(BaseHTTPRequestHandler):

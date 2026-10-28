@@ -4,7 +4,9 @@
 *.db
 *.log
 run_*.txt
+settings_backup.json
 __pycache__/
 *.pyc
 *.bat
 DEPLOY.md
+_test_*.py

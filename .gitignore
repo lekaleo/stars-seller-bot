@@ -2,4 +2,8 @@
 *.db
 *.log
 run_*.txt
+settings_backup.json
+settings_backup.json.tmp
 __pycache__/
+*.pyc
+_test_*.py
