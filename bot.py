@@ -188,6 +188,8 @@ def get_message_html_with_custom_emojis(message) -> str:
 
     opens = {}   # индекс символа -> [(UTF-16 конец, открывающий тег)]
     closes = {}  # индекс символа -> [(UTF-16 начало, закрывающий тег)]
+    custom_count = 0
+    custom_seen = 0
 
     for e in entities:
         start = bisect.bisect_left(offsets, e.offset)
@@ -198,10 +200,13 @@ def get_message_html_with_custom_emojis(message) -> str:
             continue
 
         if e.type == 'custom_emoji':
-            emoji_id = getattr(e, 'custom_emoji_id', None)
-            if not emoji_id:
+            custom_seen += 1
+            emoji_id = str(getattr(e, 'custom_emoji_id', '') or '')
+            if not emoji_id.isdigit():
+                logger.warning("Премиум-эмодзи без корректного custom_emoji_id — пропущен")
                 continue
             pair = (f'<tg-emoji emoji-id="{emoji_id}">', '</tg-emoji>')
+            custom_count += 1
         elif e.type == 'text_link' and getattr(e, 'url', None):
             pair = (f'<a href="{html.escape(e.url, quote=True)}">', '</a>')
         elif e.type in ENTITY_TAGS:
@@ -222,7 +227,13 @@ def get_message_html_with_custom_emojis(message) -> str:
             parts.append(tag)
         if i < total:
             parts.append(html.escape(text[i]))
-    return ''.join(parts)
+
+    result = ''.join(parts)
+    if custom_seen and not custom_count:
+        logger.warning("В сообщении %s Премиум-эмодзи, но ни один не сохранён тегом", custom_seen)
+    elif custom_count:
+        logger.info("Сохранено Премиум-эмодзи тегами <tg-emoji>: %s", custom_count)
+    return result
 
 
 # === Редактируемые названия кнопок (ШАГ 2) ===
@@ -325,54 +336,77 @@ def is_rate_limited(context, user_id) -> bool:
 
 
 # === БД: настройки + заказы ===
+# ВАЖНО: базовые тексты (TEXT_DEFAULTS) и названия кнопок (BUTTON_DEFAULTS) зашиты в код.
+# SQLite здесь — только кэш правок админа. На бесплатном хостинге файловая система стирается
+# при передеплое: бот всё равно стартует и работает на дефолтах из кода.
 def init_db():
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute("DROP TABLE IF EXISTS catalog")
-    c.execute('''CREATE TABLE IF NOT EXISTS settings (
-        key TEXT PRIMARY KEY, value TEXT)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS reviews (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT, text TEXT)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS orders (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, buyer TEXT, recipient TEXT, stars INTEGER, total REAL, status TEXT)''')
-    # Миграция: колонка buyer_id (для уведомлений покупателю)
     try:
-        c.execute("ALTER TABLE orders ADD COLUMN buyer_id INTEGER")
-        logger.info("Добавлена колонка orders.buyer_id")
-    except sqlite3.OperationalError:
-        pass  # колонка уже существует
-    conn.commit()
-    conn.close()
-    logger.info("База данных инициализирована: %s", DB_NAME)
+        conn = sqlite3.connect(DB_NAME)
+        c = conn.cursor()
+        c.execute("DROP TABLE IF EXISTS catalog")
+        c.execute('''CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY, value TEXT)''')
+        c.execute('''CREATE TABLE IF NOT EXISTS reviews (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT, text TEXT)''')
+        c.execute('''CREATE TABLE IF NOT EXISTS orders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, buyer TEXT, recipient TEXT, stars INTEGER, total REAL, status TEXT)''')
+        # Миграция: колонка buyer_id (для уведомлений покупателю)
+        try:
+            c.execute("ALTER TABLE orders ADD COLUMN buyer_id INTEGER")
+            logger.info("Добавлена колонка orders.buyer_id")
+        except sqlite3.OperationalError:
+            pass  # колонка уже существует
+        conn.commit()
+        conn.close()
+        logger.info("База данных инициализирована: %s", DB_NAME)
+    except (sqlite3.Error, OSError) as exc:
+        logger.error(
+            "БД недоступна (%s): %s — продолжаем работу на дефолтах из кода", DB_NAME, exc)
 
 
 def set_setting(key, value):
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute(
-        "INSERT INTO settings (key, value) VALUES (?, ?) "
-        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        (key, value)
-    )
-    conn.commit()
-    conn.close()
+    """Пишет настройку в кэш-БД. Ошибки БД не должны ломать бота."""
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        c = conn.cursor()
+        c.execute(
+            "INSERT INTO settings (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, value)
+        )
+        conn.commit()
+        conn.close()
+        return True
+    except (sqlite3.Error, OSError) as exc:
+        logger.error("Не удалось сохранить настройку '%s' в БД: %s", key, exc)
+        return False
 
 
 def get_setting(key):
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute("SELECT value FROM settings WHERE key = ?", (key,))
-    row = c.fetchone()
-    conn.close()
-    return row[0] if row else None
+    """Читает настройку из кэш-БД; None означает «использовать дефолт из кода»."""
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        c = conn.cursor()
+        c.execute("SELECT value FROM settings WHERE key = ?", (key,))
+        row = c.fetchone()
+        conn.close()
+        return row[0] if row else None
+    except (sqlite3.Error, OSError) as exc:
+        logger.warning("Не удалось прочитать настройку '%s': %s", key, exc)
+        return None
 
 
 def delete_setting(key):
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute("DELETE FROM settings WHERE key = ?", (key,))
-    conn.commit()
-    conn.close()
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        c = conn.cursor()
+        c.execute("DELETE FROM settings WHERE key = ?", (key,))
+        conn.commit()
+        conn.close()
+        return True
+    except (sqlite3.Error, OSError) as exc:
+        logger.error("Не удалось удалить настройку '%s': %s", key, exc)
+        return False
 
 
 def buyer_name(user) -> str:
@@ -598,13 +632,16 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not text_html:
             await update.message.reply_text("❌ Отправьте текстовое сообщение.")
             return
-        set_setting('txt_' + key, text_html)
+        saved_ok = set_setting('txt_' + key, text_html)
         context.user_data['state'] = ''
         logger.info("Админ %s обновил текст экрана '%s' (%s символов)", user.id, key, len(text_html))
+        warn = "" if saved_ok else (
+            "\n\n⚠️ БД недоступна: текст применён сейчас, но после перезапуска "
+            "вернётся дефолт из кода.")
         await update.message.reply_text(
             f"✅ <b>Текст экрана «{SCREEN_TITLES[key]}» обновлён!</b>\n\n"
             "Проверьте соответствующий раздел бота. Изменения применяются сразу.\n"
-            "Ниже — как текст выглядит для покупателей:",
+            "Ниже — как текст выглядит для покупателей:" + warn,
             parse_mode='HTML'
         )
         try:
@@ -625,12 +662,15 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not new_label:
             await update.message.reply_text("❌ Отправьте текстовое сообщение.")
             return
-        set_setting('btn_' + key, new_label)
+        saved_ok = set_setting('btn_' + key, new_label)
         context.user_data['state'] = ''
         logger.info("Админ %s обновил название кнопки '%s': %s", user.id, key, new_label)
+        warn = "" if saved_ok else (
+            "\n\n⚠️ БД недоступна: название применено сейчас, но после перезапуска "
+            "вернётся дефолт из кода.")
         await update.message.reply_text(
             f"✅ <b>Название кнопки «{BUTTON_TITLES[key]}» обновлено!</b>\n\n"
-            f"Новое название: {html.escape(new_label)}",
+            f"Новое название: {html.escape(new_label)}" + warn,
             parse_mode='HTML'
         )
 
@@ -1543,6 +1583,9 @@ def start_health_server():
 def main():
     init_db()
     logger.info("Администратор (ADMIN_ID): %s", ADMIN_ID)
+    logger.info(
+        "Дефолты зашиты в код: %s экранов текста и %s кнопок — БД необязательна, "
+        "settings используется как кэш правок", len(TEXT_DEFAULTS), len(BUTTON_DEFAULTS))
 
     threading.Thread(target=start_health_server, daemon=True).start()
 
