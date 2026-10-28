@@ -1518,11 +1518,14 @@ async def back_to_menu(query, context):
 
 
 # === HealthCheck HTTP-сервер (для 24/7 бесплатного облачного хостинга) ===
+BOT_VERSION = "2026-10-28.2"
+
+
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Bot is running 24/7 OK")
+        self.wfile.write(f"Bot is running 24/7 OK (v{BOT_VERSION})".encode())
 
     def log_message(self, format, *args):
         pass  # не засоряем лог
