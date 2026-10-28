@@ -1558,7 +1558,7 @@ async def back_to_menu(query, context):
 
 
 # === HealthCheck HTTP-сервер (для 24/7 бесплатного облачного хостинга) ===
-BOT_VERSION = "2026-10-28.2"
+BOT_VERSION = "2026-10-28.3"
 
 
 class HealthCheckHandler(BaseHTTPRequestHandler):
