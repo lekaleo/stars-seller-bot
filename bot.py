@@ -80,7 +80,14 @@ def get_menu_emoji() -> tuple:
 def main_text() -> str:
     emoji_id, fallback = get_menu_emoji()
     prefix = f'<tg-emoji emoji-id="{emoji_id}">{fallback}</tg-emoji> ' if emoji_id else ''
-    return prefix + MAIN_TEXT_TEMPLATE.format(rate=get_rate())
+
+    # Кастомный текст приветствия из БД (задаётся в /admin → "Изменить текст приветствия")
+    custom = get_setting('custom_welcome_text')
+    if custom:
+        body = custom.replace('{rate}', f'{get_rate():g}')
+    else:
+        body = MAIN_TEXT_TEMPLATE.format(rate=get_rate())
+    return prefix + body
 
 
 def main_keyboard():
@@ -222,6 +229,9 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         'adm_rate': admin_rate,
         'adm_emoji': admin_emoji,
         'adm_emoji_clear': admin_emoji_clear,
+        'adm_edit_text': admin_edit_text,
+        'adm_reset_text': admin_reset_text,
+        'adm_pay_links': admin_pay_links,
         'adm_back': admin_back,
     }
 
@@ -265,19 +275,37 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state = context.user_data.get('state', '')
     user = update.effective_user
 
-    # Эхо ID кастомных премиум-эмодзи для владельца
-    if user.id == ADMIN_ID and update.message.entities:
-        custom_ids = [
-            e.custom_emoji_id for e in update.message.entities
+    # Премиум-эмодзи от владельца: сначала проверяем режим установки, потом эхо
+    if (user.id == ADMIN_ID and update.message.entities
+            and state not in ('WAIT_WELCOME_TEXT',)):
+        custom_entities = [
+            e for e in update.message.entities
             if e.type == 'custom_emoji' and getattr(e, 'custom_emoji_id', None)
         ]
-        if custom_ids:
-            logger.info("Админ %s запросил custom_emoji_id", user.id)
-            await update.message.reply_text(
-                "custom_emoji_id: {\n" +
-                "\n".join(f"    '{cid}'," for cid in custom_ids) +
-                "\n}"
-            )
+        if custom_entities:
+            cid = custom_entities[0].custom_emoji_id
+
+            # Режим установки эмодзи в меню (ШАГ 1: состояние теперь срабатывает!)
+            if state == 'WAIT_EMOJI':
+                ent = custom_entities[0]
+                raw = update.message.text or ''
+                fallback = raw[ent.offset:ent.offset + ent.length] or '⚡'
+                set_setting('menu_emoji_id', cid)
+                set_setting('menu_emoji_fallback', fallback)
+                context.user_data['state'] = ''
+                logger.info("Админ %s установил премиум-эмодзи в меню: %s (фолбэк %s)",
+                            user.id, cid, fallback)
+                await update.message.reply_text(
+                    "✅ <b>Премиум-эмодзи успешно установлен в заголовок меню!</b>\n\n"
+                    f"ID: <code>{cid}</code>\n"
+                    f"Запасной символ: {fallback}\n\n"
+                    "Проверьте командой /start.",
+                    parse_mode='HTML'
+                )
+                return
+
+            logger.info("Админ %s прислал custom_emoji_id: %s", user.id, cid)
+            await update.message.reply_text(f"custom_emoji_id: '{cid}'")
             return
 
     if is_rate_limited(context, user.id):
@@ -326,6 +354,47 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode='HTML'
         )
 
+    elif state == 'WAIT_WELCOME_TEXT':
+        if user.id != ADMIN_ID:
+            await update.message.reply_text("⛔ Нет прав.")
+            return
+        # text_html сохраняет жирный/курсив/ссылки и теги <tg-emoji>
+        html = update.message.text_html
+        if not html:
+            await update.message.reply_text("❌ Отправьте текстовое сообщение.")
+            return
+        set_setting('custom_welcome_text', html)
+        context.user_data['state'] = ''
+        logger.info("Админ %s обновил текст приветствия (%s символов)", user.id, len(html))
+        await update.message.reply_text(
+            "✅ <b>Текст приветствия обновлён!</b>\n\n"
+            "Проверьте командой /start. Кнопка «🔄 Сбросить текст по умолчанию» "
+            "вернёт стандартный шаблон.",
+            parse_mode='HTML'
+        )
+
+    elif state == 'WAIT_PAY_URL':
+        if user.id != ADMIN_ID:
+            await update.message.reply_text("⛔ Нет прав.")
+            return
+        parts = text_in.split(maxsplit=1)
+        if len(parts) != 2 or parts[0] not in ('1', '2', '3') or not parts[1].startswith('http'):
+            await update.message.reply_text(
+                "❌ Неверный формат. Пример:\n<code>1 https://pay.example.ru/sbp</code>",
+                parse_mode='HTML'
+            )
+            return
+        keys = {'1': 'sbp_url', '2': 'card_url', '3': 'crypto_url'}
+        names = {'1': 'СБП', '2': 'карта РФ', '3': 'криптовалюта'}
+        key = keys[parts[0]]
+        set_setting(key, parts[1].strip())
+        context.user_data['state'] = ''
+        logger.info("Админ %s обновил ссылку оплаты %s: %s", user.id, key, parts[1])
+        await update.message.reply_text(
+            f"✅ <b>Ссылка для «{names[parts[0]]}» обновлена!</b>\n\n<code>{parts[1]}</code>",
+            parse_mode='HTML'
+        )
+
     elif state == 'WAIT_STARS':
         try:
             count = int(text_in)
@@ -353,10 +422,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def show_star_options(query_or_update, context):
     username = context.user_data.get('recipient', '@----')
+    rate = get_rate()
     keyboard = [
-        [InlineKeyboardButton("🌟 100 звёзд (140₽)", callback_data='stars_100')],
-        [InlineKeyboardButton("🌟 1000 звёзд (1400₽)", callback_data='stars_1000')],
-        [InlineKeyboardButton("🌟 10000 звёзд (14000₽)", callback_data='stars_10000')],
+        [InlineKeyboardButton(f"🌟 100 звёзд ({round(100 * rate, 2):g}₽)", callback_data='stars_100')],
+        [InlineKeyboardButton(f"🌟 1000 звёзд ({round(1000 * rate, 2):g}₽)", callback_data='stars_1000')],
+        [InlineKeyboardButton(f"🌟 10000 звёзд ({round(10000 * rate, 2):g}₽)", callback_data='stars_10000')],
         [InlineKeyboardButton("🔙 Назад", callback_data='back')]
     ]
 
@@ -571,10 +641,15 @@ async def show_payment(query, context):
     await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
 
 
+def get_payment_url(setting_key: str, env_default: str) -> str:
+    """Ссылка оплаты: сначала settings в БД (задаётся в /admin), потом переменная окружения."""
+    return get_setting(setting_key) or env_default
+
+
 async def payment_sbp(query, context):
     total = context.user_data.get('total', 0)
     order_id = context.user_data.get('order_id', 0)
-    url = build_payment_url(SBP_PAYMENT_URL, order_id, total)
+    url = build_payment_url(get_payment_url('sbp_url', SBP_PAYMENT_URL), order_id, total)
     logger.info("Оплата СБП: заказ=%s, сумма=%s₽, ссылка=%s", order_id, total, url)
 
     keyboard = [
@@ -591,7 +666,7 @@ async def payment_sbp(query, context):
 async def payment_card(query, context):
     total = context.user_data.get('total', 0)
     order_id = context.user_data.get('order_id', 0)
-    url = build_payment_url(CARD_PAYMENT_URL, order_id, total)
+    url = build_payment_url(get_payment_url('card_url', CARD_PAYMENT_URL), order_id, total)
     logger.info("Оплата картой РФ: заказ=%s, сумма=%s₽, ссылка=%s", order_id, total, url)
 
     keyboard = [
@@ -608,7 +683,7 @@ async def payment_card(query, context):
 async def payment_crypto(query, context):
     total = context.user_data.get('total', 0)
     order_id = context.user_data.get('order_id', 0)
-    url = build_payment_url(CRYPTO_PAYMENT_URL, order_id, total)
+    url = build_payment_url(get_payment_url('crypto_url', CRYPTO_PAYMENT_URL), order_id, total)
     logger.info("Оплата криптовалютой: заказ=%s, сумма=%s₽, ссылка=%s", order_id, total, url)
 
     keyboard = [
@@ -816,6 +891,9 @@ def admin_menu_keyboard():
         [InlineKeyboardButton("⏳ Заказы на проверке", callback_data='adm_pending')],
         [InlineKeyboardButton("📊 Статистика бота", callback_data='adm_stats')],
         [InlineKeyboardButton("💱 Изменить курс звезды", callback_data='adm_rate')],
+        [InlineKeyboardButton("📝 Изменить текст приветствия", callback_data='adm_edit_text')],
+        [InlineKeyboardButton("🔄 Сбросить текст по умолчанию", callback_data='adm_reset_text')],
+        [InlineKeyboardButton("💳 Настроить ссылки оплаты", callback_data='adm_pay_links')],
         [InlineKeyboardButton("✨ Премиум-эмодзи в меню", callback_data='adm_emoji')]
     ]
 
@@ -1003,6 +1081,63 @@ async def admin_emoji_clear(query, context):
     logger.info("Админ %s убрал премиум-эмодзи из меню", query.from_user.id)
     await query.edit_message_text(
         "🗑 Премиум-эмодзи убран из заголовка меню.",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data='adm_back')]]),
+        parse_mode='HTML'
+    )
+
+
+async def admin_edit_text(query, context):
+    if query.from_user.id != ADMIN_ID:
+        await query.answer("⛔ Нет прав", show_alert=True)
+        return
+
+    context.user_data['state'] = 'WAIT_WELCOME_TEXT'
+    await query.edit_message_text(
+        "📝 <b>Редактор стартового сообщения</b>\n\n"
+        "Отправьте в чат новый текст приветствия именно в том виде, "
+        "как его должны видеть покупатели.\n\n"
+        "💡 Вы можете использовать прямо в Telegram: <b>жирный шрифт</b>, "
+        "<i>курсив</i>, ссылки и любые <b>Премиум-эмодзи</b>!\n"
+        "Чтобы в тексте автоматически подставлялся актуальный курс, "
+        "напишите <code>{rate}</code> (или просто укажите цифру).",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data='adm_back')]]),
+        parse_mode='HTML'
+    )
+
+
+async def admin_reset_text(query, context):
+    if query.from_user.id != ADMIN_ID:
+        await query.answer("⛔ Нет прав", show_alert=True)
+        return
+
+    delete_setting('custom_welcome_text')
+    context.user_data['state'] = ''
+    logger.info("Админ %s сбросил текст приветствия на стандартный", query.from_user.id)
+    await query.edit_message_text(
+        "🔄 Текст приветствия сброшен на стандартный шаблон.",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data='adm_back')]]),
+        parse_mode='HTML'
+    )
+
+
+async def admin_pay_links(query, context):
+    if query.from_user.id != ADMIN_ID:
+        await query.answer("⛔ Нет прав", show_alert=True)
+        return
+
+    sbp = get_payment_url('sbp_url', SBP_PAYMENT_URL)
+    card = get_payment_url('card_url', CARD_PAYMENT_URL)
+    crypto = get_payment_url('crypto_url', CRYPTO_PAYMENT_URL)
+    context.user_data['state'] = 'WAIT_PAY_URL'
+
+    await query.edit_message_text(
+        "💳 <b>Настройка ссылок оплаты</b>\n\n"
+        f"1️⃣ СБП: <code>{sbp}</code>\n"
+        f"2️⃣ Карта РФ: <code>{card}</code>\n"
+        f"3️⃣ Крипта: <code>{crypto}</code>\n\n"
+        "Отправьте в чат новую ссылку в формате:\n"
+        "<code>1 https://pay.example.ru/sbp</code>\n\n"
+        "Где 1 = СБП, 2 = карта РФ, 3 = крипта.",
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data='adm_back')]]),
         parse_mode='HTML'
     )
