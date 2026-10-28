@@ -70,8 +70,17 @@ def get_rate() -> float:
     return rate
 
 
+def get_menu_emoji() -> tuple:
+    """(custom_emoji_id, fallback_emoji) для акцента в заголовке меню."""
+    emoji_id = get_setting('menu_emoji_id')
+    fallback = get_setting('menu_emoji_fallback') or '⚡'
+    return emoji_id, fallback
+
+
 def main_text() -> str:
-    return MAIN_TEXT_TEMPLATE.format(rate=get_rate())
+    emoji_id, fallback = get_menu_emoji()
+    prefix = f'<tg-emoji emoji-id="{emoji_id}">{fallback}</tg-emoji> ' if emoji_id else ''
+    return prefix + MAIN_TEXT_TEMPLATE.format(rate=get_rate())
 
 
 def main_keyboard():
@@ -211,6 +220,8 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         'adm_pending': admin_pending,
         'adm_stats': admin_stats,
         'adm_rate': admin_rate,
+        'adm_emoji': admin_emoji,
+        'adm_emoji_clear': admin_emoji_clear,
         'adm_back': admin_back,
     }
 
@@ -804,7 +815,8 @@ def admin_menu_keyboard():
         [InlineKeyboardButton("📋 Последние 10 заказов", callback_data='adm_orders')],
         [InlineKeyboardButton("⏳ Заказы на проверке", callback_data='adm_pending')],
         [InlineKeyboardButton("📊 Статистика бота", callback_data='adm_stats')],
-        [InlineKeyboardButton("💱 Изменить курс звезды", callback_data='adm_rate')]
+        [InlineKeyboardButton("💱 Изменить курс звезды", callback_data='adm_rate')],
+        [InlineKeyboardButton("✨ Премиум-эмодзи в меню", callback_data='adm_emoji')]
     ]
 
 
@@ -951,6 +963,46 @@ async def admin_rate(query, context):
         f"💱 <b>Изменение курса звезды</b>\n\n"
         f"Текущий курс: <b>{get_rate()}₽</b> за звезду\n\n"
         "Отправьте новое значение в чат (например: <code>1.45</code>):",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data='adm_back')]]),
+        parse_mode='HTML'
+    )
+
+
+async def admin_emoji(query, context):
+    if query.from_user.id != ADMIN_ID:
+        await query.answer("⛔ Нет прав", show_alert=True)
+        return
+
+    context.user_data['state'] = 'WAIT_EMOJI'
+    emoji_id, fallback = get_menu_emoji()
+    current = f"<code>{emoji_id}</code>" if emoji_id else "не задан"
+
+    keyboard = [
+        [InlineKeyboardButton("🗑 Убрать эмодзи", callback_data='adm_emoji_clear')],
+        [InlineKeyboardButton("🔙 Назад", callback_data='adm_back')]
+    ]
+    await query.edit_message_text(
+        f"✨ <b>Премиум-эмодзи в заголовке меню</b>\n\n"
+        f"Текущий: {current}\n\n"
+        "Отправьте в чат сообщение с <b>кастомным премиум-эмодзи</b> — "
+        "бот возьмёт его ID и поставит в начало главного экрана.\n\n"
+        "⚠️ Требуется Telegram Premium у владельца бота.",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode='HTML'
+    )
+
+
+async def admin_emoji_clear(query, context):
+    if query.from_user.id != ADMIN_ID:
+        await query.answer("⛔ Нет прав", show_alert=True)
+        return
+
+    delete_setting('menu_emoji_id')
+    delete_setting('menu_emoji_fallback')
+    context.user_data['state'] = ''
+    logger.info("Админ %s убрал премиум-эмодзи из меню", query.from_user.id)
+    await query.edit_message_text(
+        "🗑 Премиум-эмодзи убран из заголовка меню.",
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data='adm_back')]]),
         parse_mode='HTML'
     )
