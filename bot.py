@@ -41,11 +41,26 @@ load_dotenv(ENV_FILE)
 # иначе — bot.db рядом с bot.py
 DB_NAME = os.getenv("DB_PATH") or os.path.join(BASE_DIR, "bot.db")
 
+# PostgreSQL (бесплатный Neon) — постоянное хранение заказов и настроек в облаке.
+# Если DATABASE_URL не задан, бот работает на локальном SQLite (как раньше).
+DATABASE_URL = (os.getenv("DATABASE_URL") or "").strip()
+DB_IS_POSTGRES = bool(DATABASE_URL)
+
+try:
+    import psycopg  # требуется только при DATABASE_URL
+except ImportError:  # локальный запуск без psycopg — норм
+    psycopg = None
+
 TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "481441820"))
 SBP_PAYMENT_URL = os.getenv("SBP_PAYMENT_URL", "https://pay.platega.io/sbp_placeholder")
 CARD_PAYMENT_URL = os.getenv("CARD_PAYMENT_URL", "https://pay.platega.io/card_placeholder")
 CRYPTO_PAYMENT_URL = os.getenv("CRYPTO_PAYMENT_URL", "https://t.me/send?start=crypto_placeholder")
+
+# Fragment (автовыдача звёзд) — переменные для будущей автоматизации
+FRAGMENT_API_URL = os.getenv("FRAGMENT_API_URL", "https://fragment.com/api")
+FRAGMENT_API_KEY = (os.getenv("FRAGMENT_API_KEY") or "").strip()
+FRAGMENT_WALLET_COOKIE = (os.getenv("FRAGMENT_WALLET_COOKIE") or "").strip()
 
 # === Настройки ===
 DEFAULT_RATE = 1.4  # курс по умолчанию: 1.4₽ за одну звезду (меняется в админке)
@@ -335,13 +350,109 @@ def is_rate_limited(context, user_id) -> bool:
     return False
 
 
+# === Слой БД: SQLite (локально) / PostgreSQL Neon (облако) ===
+class Row(dict):
+    """Строка результата: row['id'] и row[0] работают одинаково (как sqlite3.Row)."""
+
+    def __getitem__(self, key):
+        if isinstance(key, int):
+            return list(self.values())[key]
+        return super().__getitem__(key)
+
+
+def _pg_row_factory(cursor):
+    """Фабрика строк psycopg: dict-подобная Row."""
+    values = cursor.fetchone()
+    if values is None:
+        return None
+    return Row(zip([d.name for d in cursor.description], values))
+
+
+def adapt_sql(sql: str) -> str:
+    """SQLite-SQL -> PostgreSQL-SQL: ? -> %s, AUTOINCREMENT -> SERIAL."""
+    if not DB_IS_POSTGRES:
+        return sql
+    sql = re.sub(r'INTEGER\s+PRIMARY\s+KEY\s+AUTOINCREMENT', 'SERIAL PRIMARY KEY', sql, flags=re.I)
+    return sql.replace('?', '%s')
+
+
+class _PgCursor:
+    """Мини-совместимость с sqlite3.Cursor: execute/fetchone/fetchall/lastrowid."""
+
+    def __init__(self, conn):
+        self._conn = conn
+        self._cur = None
+        self._cached = None
+        self.lastrowid = None
+
+    def execute(self, sql, params=()):
+        sql = adapt_sql(sql)
+        table = None
+        insert = sql.lstrip()[:6].upper() == 'INSERT'
+        if insert:
+            match = re.search(r'INSERT\s+INTO\s+"?(\w+)"?', sql, re.I)
+            table = match.group(1).lower() if match else None
+        wants_id = table in ('orders', 'reviews') and 'RETURNING' not in sql.upper()
+        if wants_id:
+            sql = sql.rstrip().rstrip(';') + ' RETURNING id'
+        try:
+            self._cur = self._conn._conn.cursor()
+            self._cur.execute(sql, params)
+            if wants_id:
+                row = self._cur.fetchone()
+                self.lastrowid = row['id'] if row else None
+        except Exception:
+            self._conn._conn.rollback()
+            raise
+        return self
+
+    def fetchone(self):
+        if self._cached is not None:
+            row, self._cached = self._cached, None
+            return row
+        return self._cur.fetchone() if self._cur else None
+
+    def fetchall(self):
+        return self._cur.fetchall() if self._cur else []
+
+
+class _PgConn:
+    def __init__(self, dsn):
+        self._conn = psycopg.connect(dsn, row_factory=_pg_row_factory)
+        self.row_factory = None  # совместимость с sqlite3 (присваивание игнорируется)
+
+    def cursor(self):
+        return _PgCursor(self)
+
+    def commit(self):
+        self._conn.commit()
+
+    def rollback(self):
+        self._conn.rollback()
+
+    def close(self):
+        self._conn.close()
+
+
+def connect_db():
+    """PostgreSQL при заданном DATABASE_URL, иначе локальный SQLite."""
+    if DB_IS_POSTGRES:
+        if psycopg is None:
+            raise RuntimeError("DATABASE_URL задан, но пакет psycopg не установлен")
+        return _PgConn(DATABASE_URL)
+    return sqlite3.connect(DB_NAME)
+
+
 # === БД: настройки + заказы ===
 # ВАЖНО: базовые тексты (TEXT_DEFAULTS) и названия кнопок (BUTTON_DEFAULTS) зашиты в код.
-# SQLite здесь — только кэш правок админа. На бесплатном хостинге файловая система стирается
-# при передеплое: бот всё равно стартует и работает на дефолтах из кода.
+# БД используется для истории заказов; settings — лишь необязательный кэш правок админа.
+# Если БД пуста/удалена/недоступна, бот стартует и работает на константах из кода.
+_SETTINGS_CACHE = {}  # оперативные правки админа в памяти (когда БД недоступна)
+
+
 def init_db():
     try:
-        conn = sqlite3.connect(DB_NAME)
+        conn = connect_db()
         c = conn.cursor()
         c.execute("DROP TABLE IF EXISTS catalog")
         c.execute('''CREATE TABLE IF NOT EXISTS settings (
@@ -354,20 +465,23 @@ def init_db():
         try:
             c.execute("ALTER TABLE orders ADD COLUMN buyer_id INTEGER")
             logger.info("Добавлена колонка orders.buyer_id")
-        except sqlite3.OperationalError:
-            pass  # колонка уже существует
+        except Exception:
+            conn.rollback()  # колонка уже существует (SQLite/PostgreSQL)
         conn.commit()
         conn.close()
-        logger.info("База данных инициализирована: %s", DB_NAME)
-    except (sqlite3.Error, OSError) as exc:
+        logger.info("База данных инициализирована: %s",
+                    "PostgreSQL" if DB_IS_POSTGRES else DB_NAME)
+    except Exception as exc:
         logger.error(
-            "БД недоступна (%s): %s — продолжаем работу на дефолтах из кода", DB_NAME, exc)
+            "БД недоступна (%s): %s — продолжаем работу на дефолтах из кода",
+            "PostgreSQL" if DB_IS_POSTGRES else DB_NAME, exc)
 
 
 def set_setting(key, value):
-    """Пишет настройку в кэш-БД. Ошибки БД не должны ломать бота."""
+    """Пишет настройку: в память (всегда) и в БД (если доступна). БД не обязательна."""
+    _SETTINGS_CACHE[key] = value
     try:
-        conn = sqlite3.connect(DB_NAME)
+        conn = connect_db()
         c = conn.cursor()
         c.execute(
             "INSERT INTO settings (key, value) VALUES (?, ?) "
@@ -377,34 +491,36 @@ def set_setting(key, value):
         conn.commit()
         conn.close()
         return True
-    except (sqlite3.Error, OSError) as exc:
-        logger.error("Не удалось сохранить настройку '%s' в БД: %s", key, exc)
+    except Exception as exc:
+        logger.error("Не удалось сохранить настройку '%s' в БД: %s (держим в памяти)", key, exc)
         return False
 
 
 def get_setting(key):
-    """Читает настройку из кэш-БД; None означает «использовать дефолт из кода»."""
+    """Настройка из БД (если есть), иначе из памяти, иначе None -> дефолт из кода."""
     try:
-        conn = sqlite3.connect(DB_NAME)
+        conn = connect_db()
         c = conn.cursor()
         c.execute("SELECT value FROM settings WHERE key = ?", (key,))
         row = c.fetchone()
         conn.close()
-        return row[0] if row else None
-    except (sqlite3.Error, OSError) as exc:
+        if row:
+            return row[0]
+    except Exception as exc:
         logger.warning("Не удалось прочитать настройку '%s': %s", key, exc)
-        return None
+    return _SETTINGS_CACHE.get(key)
 
 
 def delete_setting(key):
+    _SETTINGS_CACHE.pop(key, None)
     try:
-        conn = sqlite3.connect(DB_NAME)
+        conn = connect_db()
         c = conn.cursor()
         c.execute("DELETE FROM settings WHERE key = ?", (key,))
         conn.commit()
         conn.close()
         return True
-    except (sqlite3.Error, OSError) as exc:
+    except Exception as exc:
         logger.error("Не удалось удалить настройку '%s': %s", key, exc)
         return False
 
@@ -780,15 +896,19 @@ async def calculate_cost(update_or_query, context):
     buyer_id = user.id if user else None
 
     # Сохраняем заказ в БД
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute(
-        "INSERT INTO orders (buyer, buyer_id, recipient, stars, total, status) VALUES (?, ?, ?, ?, ?, ?)",
-        (buyer, buyer_id, recipient, stars, total, "created")
-    )
-    order_id = c.lastrowid
-    conn.commit()
-    conn.close()
+    try:
+        conn = connect_db()
+        c = conn.cursor()
+        c.execute(
+            "INSERT INTO orders (buyer, buyer_id, recipient, stars, total, status) VALUES (?, ?, ?, ?, ?, ?)",
+            (buyer, buyer_id, recipient, stars, total, "created")
+        )
+        order_id = c.lastrowid
+        conn.commit()
+        conn.close()
+    except Exception as exc:
+        logger.exception("Не удалось сохранить заказ звёзд в БД: %s", exc)
+        order_id = 0
 
     context.user_data['order_id'] = order_id
 
@@ -866,15 +986,19 @@ async def select_premium(query, context, months, price):
     buyer_id = user.id if user else None
 
     # Сохраняем заказ в БД (stars=0, тип в status)
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute(
-        "INSERT INTO orders (buyer, buyer_id, recipient, stars, total, status) VALUES (?, ?, ?, ?, ?, ?)",
-        (buyer, buyer_id, recipient, 0, price, f"premium_{months}m")
-    )
-    order_id = c.lastrowid
-    conn.commit()
-    conn.close()
+    try:
+        conn = connect_db()
+        c = conn.cursor()
+        c.execute(
+            "INSERT INTO orders (buyer, buyer_id, recipient, stars, total, status) VALUES (?, ?, ?, ?, ?, ?)",
+            (buyer, buyer_id, recipient, 0, price, f"premium_{months}m")
+        )
+        order_id = c.lastrowid
+        conn.commit()
+        conn.close()
+    except Exception as exc:
+        logger.exception("Не удалось сохранить Premium-заказ в БД: %s", exc)
+        order_id = 0
 
     context.user_data['order_id'] = order_id
 
@@ -1016,7 +1140,7 @@ async def remove_sticker(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # === Заказы: хелперы ===
 def get_order(order_id):
     """Возвращает dict заказа или None."""
-    conn = sqlite3.connect(DB_NAME)
+    conn = connect_db()
     conn.row_factory = sqlite3.Row
     c = conn.cursor()
     c.execute(
@@ -1031,7 +1155,7 @@ def get_order(order_id):
 
 
 def set_order_status(order_id, status):
-    conn = sqlite3.connect(DB_NAME)
+    conn = connect_db()
     c = conn.cursor()
     c.execute("UPDATE orders SET status = ? WHERE id = ?", (status, order_id))
     conn.commit()
@@ -1105,6 +1229,78 @@ async def customer_paid(query, context, order_id):
 
 
 # === Админ: подтвердить / отклонить ===
+# === Fragment: автоматическая покупка звёзд (заготовка под автовыдачу) ===
+async def fragment_auto_buy(recipient_username: str, stars_amount: int) -> dict:
+    """Автоматически отправляет звёзды получателю через Fragment.
+
+    Возвращает словарь:
+        {"success": True,  "tx_id": "..."}
+        {"success": False, "error": "..."}
+
+    Сейчас это каркас: реальная интеграция требует авторизованной сессии кошелька
+    Fragment (FRAGMENT_WALLET_COOKIE) либо ключа API (FRAGMENT_API_KEY).
+    Пока переменные не заданы — функция честно сообщает, что автовыдача не настроена,
+    и админ выдаёт заказ вручную.
+    """
+    recipient_username = (recipient_username or "").strip()
+    try:
+        stars_amount = int(stars_amount)
+    except (TypeError, ValueError):
+        return {"success": False, "error": f"Некорректное количество звёзд: {stars_amount!r}"}
+
+    if not recipient_username.startswith('@') or not USERNAME_RE.match(recipient_username):
+        return {"success": False, "error": f"Некорректный @username: {recipient_username!r}"}
+    if stars_amount <= 0:
+        return {"success": False, "error": "Количество звёзд должно быть больше нуля"}
+
+    if not FRAGMENT_API_KEY and not FRAGMENT_WALLET_COOKIE:
+        logger.warning(
+            "Fragment autobuy: автовыдача не настроена (нет FRAGMENT_API_KEY/FRAGMENT_WALLET_COOKIE) — "
+            "заказ %s ⭐ для %s нужно выдать вручную", stars_amount, recipient_username)
+        return {"success": False, "error": "Автовыдача не настроена (нет доступа к Fragment)"}
+
+    payload = {
+        "recipient": recipient_username,
+        "amount": stars_amount,
+        "currency": "TON",      # Fragment продаёт звёзды за TON
+        "method": "buy_stars",
+    }
+    headers = {"Content-Type": "application/json"}
+    if FRAGMENT_API_KEY:
+        headers["X-API-Key"] = FRAGMENT_API_KEY
+    if FRAGMENT_WALLET_COOKIE:
+        headers["Cookie"] = FRAGMENT_WALLET_COOKIE
+
+    try:
+        import json as _json
+        import urllib.request as _urlreq
+
+        request = _urlreq.Request(
+            FRAGMENT_API_URL,
+            data=_json.dumps(payload).encode('utf-8'),
+            headers=headers,
+            method='POST',
+        )
+        with _urlreq.urlopen(request, timeout=25) as response:
+            raw = response.read().decode('utf-8', errors='replace')
+        data = _json.loads(raw) if raw else {}
+
+        tx_id = data.get('tx_id') or data.get('transaction_id') or data.get('id')
+        if data.get('ok') or data.get('success') or tx_id:
+            logger.info("Fragment autobuy: %s ⭐ для %s — успех, tx=%s",
+                        stars_amount, recipient_username, tx_id)
+            return {"success": True, "tx_id": str(tx_id or '')}
+
+        error = data.get('error') or data.get('message') or raw[:300]
+        logger.error("Fragment autobuy: отказ для %s (%s ⭐): %s",
+                     recipient_username, stars_amount, error)
+        return {"success": False, "error": str(error)}
+    except Exception as exc:
+        logger.exception("Fragment autobuy: ошибка запроса для %s: %s",
+                         recipient_username, exc)
+        return {"success": False, "error": f"{type(exc).__name__}: {exc}"}
+
+
 async def admin_approve(query, context, order_id):
     if query.from_user.id != ADMIN_ID:
         await query.answer("⛔ Нет прав", show_alert=True)
@@ -1118,11 +1314,36 @@ async def admin_approve(query, context, order_id):
     set_order_status(order_id, 'completed')
     logger.info("Админ подтвердил заказ #%s (completed)", order_id)
 
+    # Автовыдача звёзд через Fragment (для звёздных заказов)
+    try:
+        stars = int(row.get('stars') or 0)
+    except (TypeError, ValueError):
+        stars = 0
+
+    autobuy_line = "ℹ️ Premium-заказ: выдаётся вручную."
+    if stars > 0:
+        await query.edit_message_text(
+            f"⏳ <b>Заказ #{order_id}: пробую автовыдачу через Fragment…</b>\n\n"
+            f"🎯 Получатель: <code>{row['recipient']}</code>\n"
+            f"⭐ Звёзды: {stars}",
+            parse_mode='HTML'
+        )
+        result = await fragment_auto_buy(row['recipient'], stars)
+        logger.info("Fragment autobuy по заказу #%s (%s ⭐): %s", order_id, stars, result)
+        if result.get('success'):
+            tx_id = html.escape(str(result.get('tx_id') or '—'))
+            autobuy_line = f"✅ Автовыдача Fragment: успешно (tx: <code>{tx_id}</code>)"
+        else:
+            error = html.escape(str(result.get('error') or 'неизвестная ошибка'))
+            autobuy_line = (f"⚠️ Автовыдача не выполнена: <i>{error}</i>\n"
+                            "Выдайте заказ вручную и проверьте настройки Fragment.")
+
     await query.edit_message_text(
         f"✅ <b>Заказ #{order_id} выполнен!</b>\n\n"
         f"🎯 Получатель: <code>{row['recipient']}</code>\n"
         f"📦 {free_text_of(row)}\n"
-        f"💰 {row['total']}₽",
+        f"💰 {row['total']}₽\n\n"
+        f"{autobuy_line}",
         parse_mode='HTML'
     )
 
@@ -1220,7 +1441,7 @@ async def admin_orders(query, context):
         await query.answer("⛔ Нет прав", show_alert=True)
         return
 
-    conn = sqlite3.connect(DB_NAME)
+    conn = connect_db()
     conn.row_factory = sqlite3.Row
     c = conn.cursor()
     c.execute(
@@ -1253,7 +1474,7 @@ async def admin_pending(query, context):
         await query.answer("⛔ Нет прав", show_alert=True)
         return
 
-    conn = sqlite3.connect(DB_NAME)
+    conn = connect_db()
     conn.row_factory = sqlite3.Row
     c = conn.cursor()
     c.execute(
@@ -1296,7 +1517,7 @@ async def admin_stats(query, context):
         await query.answer("⛔ Нет прав", show_alert=True)
         return
 
-    conn = sqlite3.connect(DB_NAME)
+    conn = connect_db()
     c = conn.cursor()
     total_count = c.execute("SELECT COUNT(*) FROM orders").fetchone()[0]
     completed = c.execute("SELECT COUNT(*) FROM orders WHERE status = 'completed'").fetchone()[0]

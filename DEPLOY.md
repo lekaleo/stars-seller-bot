@@ -15,7 +15,31 @@
 | `SBP_PAYMENT_URL` | ссылка СБП (необязательно) |
 | `CARD_PAYMENT_URL` | ссылка карты РФ (необязательно) |
 | `CRYPTO_PAYMENT_URL` | ссылка крипты (необязательно) |
-| `DB_PATH` | путь к файлу БД (необязательно) |
+| `DB_PATH` | путь к SQLite-файлу (необязательно) |
+| `DATABASE_URL` | строка подключения Neon Postgres (необязательно, но нужна для постоянных заказов) |
+| `FRAGMENT_API_KEY` / `FRAGMENT_WALLET_COOKIE` | доступ к Fragment для автовыдачи звёзд (необязательно) |
+
+## Постоянное хранение заказов — Neon (бесплатно, навсегда)
+
+Без `DATABASE_URL` заказы пишутся в SQLite и стираются при передеплое.
+С `DATABASE_URL` заказы живут в Postgres и не теряются.
+
+1. https://neon.tech → **Sign up with GitHub** (карта не нужна).
+2. **New Project** → имя `stars-bot`, регион ближайший (Frankfurt).
+3. Скопируйте **Connection string** вида
+   `postgresql://user:pass@ep-xxx.eu-central-1.aws.neon.tech/neondb?sslmode=require`
+4. Render → ваш сервис → **Environment** → **Add Environment Variable**:
+   `DATABASE_URL` = эта строка → **Save Changes** (сервис перезапустится).
+5. В логах появится `База данных инициализирована: PostgreSQL`.
+
+Тексты и названия кнопок в БД не нужны: они зашиты в коде (`TEXT_DEFAULTS`/`BUTTON_DEFAULTS`),
+а `settings` — лишь необязательный кэш правок админа (при недоступной БД работает память процесса).
+
+## Fragment (автовыдача звёзд)
+
+Кнопка «✅ Выполнено (Выдано)» в `/admin` вызывает `fragment_auto_buy()`.
+Пока `FRAGMENT_API_KEY`/`FRAGMENT_WALLET_COOKIE` не заданы, функция честно отвечает
+«автовыдача не настроена», и заказ выдаётся вручную.
 
 ## Render.com (Blueprint — самый простой путь)
 
