@@ -1,3 +1,4 @@
 python-telegram-bot==22.8
 python-dotenv==1.0.1
 psycopg[binary]==3.3.6
+tonsdk==1.0.9

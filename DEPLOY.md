@@ -16,8 +16,30 @@
 | `CARD_PAYMENT_URL` | ссылка карты РФ (необязательно) |
 | `CRYPTO_PAYMENT_URL` | ссылка крипты (необязательно) |
 | `DB_PATH` | путь к SQLite-файлу (необязательно) |
-| `DATABASE_URL` | строка подключения Neon Postgres (необязательно, но нужна для постоянных заказов) |
-| `FRAGMENT_API_KEY` / `FRAGMENT_HASH` / `FRAGMENT_COOKIES` | доступ к Fragment для автовыдачи звёзд (необязательно, проще задать в `/admin`) |
+| `DATABASE_URL` | строка подключения Neon Postgres (необязательно; можно задать прямо в `/admin` → ☁️ Облако и База данных) |
+| `FRAGMENT_API_KEY` / `FRAGMENT_HASH` / `FRAGMENT_COOKIES` / `FRAGMENT_TON_MNEMONIC` | доступ к Fragment для автовыдачи звёзд (необязательно, проще задать в `/admin`) |
+| `RENDER_DEPLOY_HOOK` | Deploy Hook из Render (можно задать в `/admin` → ☁️ Облако и База данных) |
+| `RENDER_EXTERNAL_URL` | внешний адрес сервиса для self-ping (Render подставляет сам) |
+| `TONCENTER_API_KEY` | ключ toncenter.com для автооплаты TON (необязательно, без него лимит ниже) |
+
+## Авто-пинг 24/7 — встроен в бота
+
+Внешний cron-job.org больше не нужен: при старте бот запускает демон-поток
+`start_self_ping_loop()`, который **каждые 8 минут** делает HTTP GET на
+`RENDER_EXTERNAL_URL` (или на сохранённый в `/admin` адрес), поэтому Render Free
+видит входящий трафик и **не засыпает**. Проверить вручную можно кнопкой
+`📡 Пропинговать сейчас` в `/admin` → ☁️ Облако и База данных.
+
+## Управление облаком и БД из Telegram
+
+`/admin` → **☁️ Облако и База данных**:
+
+| Кнопка | Что делает |
+|---|---|
+| 🗄 Задать DATABASE_URL (Neon Postgres) | сохраняет строку подключения и **сразу переключает** `connect_db()` на PostgreSQL без перезапуска сервера (таблицы создаются, настройки переносятся) |
+| 🚀 Задать Render Deploy Hook | сохраняет ссылку Deploy Hook |
+| 🔄 Перезапустить сервер Render | POST на Deploy Hook — передеплой из Telegram в один клик |
+| 📡 Пропинговать сейчас | ручной self-ping для проверки, что контейнер жив |
 
 ## Постоянное хранение заказов — Neon (бесплатно, навсегда)
 
@@ -28,9 +50,10 @@
 2. **New Project** → имя `stars-bot`, регион ближайший (Frankfurt).
 3. Скопируйте **Connection string** вида
    `postgresql://user:pass@ep-xxx.eu-central-1.aws.neon.tech/neondb?sslmode=require`
-4. Render → ваш сервис → **Environment** → **Add Environment Variable**:
-   `DATABASE_URL` = эта строка → **Save Changes** (сервис перезапустится).
-5. В логах появится `База данных инициализирована: PostgreSQL`.
+4. Вставьте её в Telegram: `/admin` → **☁️ Облако и База данных** → `🗄 Задать DATABASE_URL`
+   — база подключится сразу, без перезапуска и без захода в панель Render.
+   (Альтернатива: Render → **Environment** → `DATABASE_URL` → **Save Changes**.)
+5. В логах появится `База данных переключена на PostgreSQL`.
 
 Тексты и названия кнопок в БД не нужны: они зашиты в коде (`TEXT_DEFAULTS`/`BUTTON_DEFAULTS`),
 а `settings` — лишь необязательный кэш правок админа (при недоступной БД работает память процесса).
@@ -45,13 +68,23 @@
 |---|---|---|
 | API-ключ | ключ сервиса автовыдачи | А: POST к API-сервису с `X-API-Key` |
 | hash + Cookie | `hash` из `fragment.com/api?hash=…` и Cookie авторизованной сессии | Б: прямой 3-шаговый поток `searchStarsRecipient` → `initBuyStarsRequest` → `getBuyStarsLink` |
-| TON-мнемоника | кошелёк для оплаты в TON | хранится для этапа оплаты |
+| TON-мнемоника | 24 слова кошелька Tonkeeper v4r2 | автооплата: транзакция подписывается (`tonsdk`) и отправляется через toncenter |
 | Режим | Автоматический / Ручной | переключается кнопкой |
 
 Значения читаются сначала из `/admin` (таблица `settings`), затем из переменных окружения
 `FRAGMENT_API_KEY` / `FRAGMENT_HASH` / `FRAGMENT_COOKIES` / `FRAGMENT_TON_MNEMONIC`.
 Если доступ не задан или включён ручной режим — функция честно отвечает
 «автовыдача не настроена», заказ помечается выполненным и выдаётся вручную.
+
+**Оплата в 1 клик.** Если мнемоника не задана, бот формирует персональную ссылку
+`https://app.tonkeeper.com/transfer/<адрес>?amount=<нанотоны>&bin=<payload>` по данным
+`transaction.messages[0]` от Fragment, и под карточкой заказа появляется кнопка
+**💎 Выдать на Fragment в 1 клик**. Без сессии Fragment кнопка ведёт на
+`https://fragment.com/stars/buy?recipient=<username>&quantity=<звёзды>`.
+
+**Автооплата.** Если задана TON-мнемоника, бот сам подписывает перевод (`tonsdk`, кошелёк v4r2),
+берёт `seqno` через `https://toncenter.com/api/v2/jsonRPC` и отправляет `sendBoc`;
+в отчёте админу появляется `оплачено автоматически` и хеш транзакции.
 
 **Важно:** у Fragment нет публичного API «купить звёзды». Способ Б использует вашу
 авторизованную сессию (Cookie) и требует `hash` со страницы покупки звёзд; способ А —
@@ -65,8 +98,10 @@
 4. Проверка: открыть `https://<имя>.onrender.com/` — должно быть `Bot is running 24/7 OK`.
 
 Важно: бесплатный web-сервис Render засыпает после **15 минут** без входящих HTTP-запросов.
-Чтобы бот не спал, поставьте бесплатный пинг раз в 10 минут (cron-job.org или UptimeRobot)
-на адрес `https://<имя>.onrender.com/`.
+Бот теперь **сам себя пингует каждые 8 минут** (`start_self_ping_loop()`), поэтому
+cron-job.org/UptimeRobot не нужны. Если Render сам не передал `RENDER_EXTERNAL_URL`,
+добавьте переменную `RENDER_EXTERNAL_URL=https://<имя>.onrender.com/` (или задайте адрес
+в `/admin` → ☁️ Облако и База данных).
 
 ## Koyeb (Free instance)
 

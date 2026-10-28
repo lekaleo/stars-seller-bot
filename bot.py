@@ -500,6 +500,69 @@ def connect_db():
     return sqlite3.connect(DB_NAME)
 
 
+def mask_secret(value: str, keep: int = 6) -> str:
+    """Маскирует секрет для показа в чате: postgresql://user:••••@host/db."""
+    value = (value or '').strip()
+    if not value:
+        return "— не задано —"
+    if '://' in value:
+        head, rest = value.split('://', 1)
+        if '@' in rest:
+            creds, host = rest.split('@', 1)
+            user = creds.split(':', 1)[0]
+            return f"{head}://{user}:••••@{host}"
+    return value[:keep] + "••••" if len(value) > keep else "••••"
+
+
+def apply_database_url(url: str, persist: bool = True) -> bool:
+    """Переключает connect_db() на PostgreSQL-базу владельца без перезапуска сервера.
+
+    Проверяет соединение, создаёт таблицы, переносит текущий кэш настроек в новую БД.
+    При любой ошибке возвращает False и оставляет прежнюю базу — бот продолжает работать.
+    """
+    global DATABASE_URL, DB_IS_POSTGRES
+
+    url = (url or '').strip()
+    if not url.lower().startswith(('postgres://', 'postgresql://')):
+        logger.error("DATABASE_URL отклонён: нужна строка postgresql://user:pass@host/db")
+        return False
+    if psycopg is None:
+        logger.error("DATABASE_URL не применён: пакет psycopg не установлен")
+        return False
+
+    old_url, old_flag = DATABASE_URL, DB_IS_POSTGRES
+    DATABASE_URL, DB_IS_POSTGRES = url, True
+    try:
+        connect_db().close()
+    except Exception as exc:
+        DATABASE_URL, DB_IS_POSTGRES = old_url, old_flag
+        logger.error("DATABASE_URL не применён (нет соединения): %s", exc)
+        return False
+
+    try:
+        init_db()  # создаёт таблицы в новой базе и подтягивает settings_backup.json
+    except Exception as exc:
+        logger.error("Не удалось создать таблицы в новой БД: %s", exc)
+
+    if persist:
+        _SETTINGS_CACHE['database_url'] = url
+    for key, value in list(_SETTINGS_CACHE.items()):
+        set_setting(key, value)
+
+    logger.info("База данных переключена на PostgreSQL: %s", mask_secret(url))
+    return True
+
+
+def ensure_database_from_settings():
+    """При старте подхватывает DATABASE_URL, сохранённый владельцем через /admin."""
+    if DB_IS_POSTGRES:
+        return
+    saved = (os.getenv('DATABASE_URL') or get_setting('database_url') or '').strip()
+    if saved:
+        logger.info("Найден сохранённый DATABASE_URL — подключаю PostgreSQL")
+        apply_database_url(saved, persist=False)
+
+
 # === БД: настройки + заказы ===
 # ВАЖНО: базовые тексты (TEXT_DEFAULTS) и названия кнопок (BUTTON_DEFAULTS) зашиты в код.
 # БД используется для истории заказов; settings — лишь необязательный кэш правок админа.
@@ -706,6 +769,11 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         'adm_buttons_menu': admin_buttons_menu,
         'adm_pay_links': admin_pay_links,
         'adm_fragment': admin_fragment,
+        'adm_cloud': admin_cloud,
+        'adm_set_db_url': admin_set_db_url,
+        'adm_set_deploy_hook': admin_set_deploy_hook,
+        'adm_restart_render': admin_restart_render,
+        'adm_ping_now': admin_ping_now,
         'adm_fragment_mode': admin_fragment_mode,
         'adm_fragment_clear': admin_fragment_clear,
         'adm_back': admin_back,
@@ -992,6 +1060,58 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton("🤖 К автовыдаче Fragment", callback_data='adm_fragment')
             ]])
+        )
+
+    elif state == 'WAIT_DB_URL':
+        if user.id != ADMIN_ID:
+            await update.message.reply_text("⛔ Нет прав.")
+            return
+        url = text_in.strip()
+        if not url.lower().startswith(('postgres://', 'postgresql://')):
+            await update.message.reply_text(
+                "❌ Нужна строка подключения Neon, начинающаяся с postgresql://\n"
+                "Попробуйте ещё раз:")
+            return
+        ok = await asyncio.to_thread(apply_database_url, url, True)
+        if not ok:
+            await update.message.reply_text(
+                "⚠️ <b>База не подключена</b> — проверьте строку и доступность Neon.\n"
+                "Бот продолжает работать на прежней базе.",
+                parse_mode='HTML'
+            )
+            return
+        context.user_data['state'] = ''
+        await update.message.reply_text(
+            "✅ <b>PostgreSQL подключён!</b>\n\n"
+            f"<code>{html.escape(mask_secret(DATABASE_URL))}</code>\n\n"
+            "Заказы теперь сохраняются постоянно и не стираются при передеплое.",
+            parse_mode='HTML',
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("☁️ К облаку", callback_data='adm_cloud')
+            ]])
+        )
+
+    elif state == 'WAIT_DEPLOY_HOOK':
+        if user.id != ADMIN_ID:
+            await update.message.reply_text("⛔ Нет прав.")
+            return
+        hook = text_in.strip()
+        if not hook.startswith('http'):
+            await update.message.reply_text(
+                "❌ Deploy Hook должен начинаться с https://\nПопробуйте ещё раз:")
+            return
+        set_setting('render_deploy_hook', hook)
+        context.user_data['state'] = ''
+        logger.info("Админ %s задал Render Deploy Hook", user.id)
+        await update.message.reply_text(
+            "✅ <b>Deploy Hook сохранён</b>\n\n"
+            f"<code>{html.escape(mask_secret(hook))}</code>",
+            parse_mode='HTML',
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔄 Перезапустить сервер Render",
+                                      callback_data='adm_restart_render')],
+                [InlineKeyboardButton("☁️ К облаку", callback_data='adm_cloud')],
+            ])
         )
 
     elif state == 'WAIT_STARS':
@@ -1367,6 +1487,14 @@ def order_card(row, with_admin_buttons=False):
             [InlineKeyboardButton("✅ Выполнено (Выдано)", callback_data=f"adm_approve_{row['id']}")],
             [InlineKeyboardButton("❌ Отклонить (Не оплачено)", callback_data=f"adm_reject_{row['id']}")]
         ]
+        try:
+            stars_in_order = int(row.get('stars') or 0)
+        except (TypeError, ValueError):
+            stars_in_order = 0
+        if stars_in_order > 0:
+            keyboard.insert(1, [InlineKeyboardButton(
+                "💎 Выдать на Fragment в 1 клик",
+                url=fragment_buy_page_link(row['recipient'], stars_in_order))])
         return text, InlineKeyboardMarkup(keyboard)
     return text, None
 
@@ -1414,6 +1542,7 @@ async def customer_paid(query, context, order_id):
 # === Fragment: автоматическая покупка звёзд ===
 FRAGMENT_TIMEOUT = 25
 FRAGMENT_API_DEFAULT = "https://fragment.com/api"
+TONCENTER_RPC = (os.getenv('TONCENTER_RPC') or "https://toncenter.com/api/v2/jsonRPC")
 
 
 def _fragment_endpoint(frag_hash: str = "") -> str:
@@ -1490,6 +1619,98 @@ def _fragment_buy_via_api(recipient: str, stars: int, api_key: str) -> dict:
     return {"success": False, "error": str(error)}
 
 
+def fragment_buy_page_link(recipient: str, stars) -> str:
+    """Публичная страница покупки звёзд на Fragment (работает без ключей и сессии)."""
+    from urllib.parse import urlencode
+    query = {'recipient': (recipient or '').lstrip('@')}
+    try:
+        quantity = int(stars)
+    except (TypeError, ValueError):
+        quantity = 0
+    if quantity > 0:
+        query['quantity'] = quantity
+    return "https://fragment.com/stars/buy?" + urlencode(query)
+
+
+def tonkeeper_pay_link(to_address: str, amount_nano: int, payload_b64: str = "") -> str:
+    """Ссылка на оплату в 1 клик через Tonkeeper (или другой TON-кошелёк)."""
+    base = f"https://app.tonkeeper.com/transfer/{to_address}?amount={int(amount_nano)}"
+    if payload_b64:
+        b64url = payload_b64.replace('+', '-').replace('/', '_').rstrip('=')
+        base += f"&bin={b64url}"
+    return base
+
+
+def _ton_rpc(method: str, params: dict) -> dict:
+    """Запрос к публичному TON RPC (toncenter.com, бесплатный)."""
+    import urllib.request as _urlreq
+
+    body = json.dumps({"id": 1, "jsonrpc": "2.0", "method": method, "params": params}).encode()
+    headers = {"Content-Type": "application/json", "Accept": "application/json"}
+    api_key = (get_setting('toncenter_api_key') or os.getenv('TONCENTER_API_KEY') or '').strip()
+    if api_key:
+        headers["X-API-Key"] = api_key
+
+    request = _urlreq.Request(TONCENTER_RPC, data=body, headers=headers, method='POST')
+    with _urlreq.urlopen(request, timeout=FRAGMENT_TIMEOUT) as response:
+        raw = response.read().decode('utf-8', errors='replace')
+    data = json.loads(raw) if raw.strip() else {}
+    if isinstance(data, dict) and data.get('error'):
+        error = data['error']
+        message = error.get('message') if isinstance(error, dict) else str(error)
+        raise RuntimeError(f"TON RPC {method}: {message}")
+    return (data or {}).get('result') or {}
+
+
+def _ton_send_payment(mnemonic: str, to_address: str, amount_nano: int,
+                      payload_b64: str = "") -> dict:
+    """Подписывает и отправляет TON-транзакцию кошельком владельца (v4r2).
+
+    Требует пакет tonsdk (pip install tonsdk). Возвращает {"success": True, "tx_id": ...}.
+    """
+    try:
+        from tonsdk.contract.wallet import Wallets, WalletVersionEnum
+        from tonsdk.utils import bytes_to_b64str
+    except ImportError as exc:
+        raise RuntimeError("не установлен пакет tonsdk — автооплата TON недоступна") from exc
+
+    words = (mnemonic or '').replace(',', ' ').split()
+    if len(words) not in (12, 24):
+        raise RuntimeError(f"в мнемонике {len(words)} слов вместо 12 или 24")
+
+    _, _, _, wallet = Wallets.from_mnemonics(words, version=WalletVersionEnum.v4r2)
+    wallet_address = wallet.address.to_string(True, True, True)
+
+    seqno = 0
+    try:
+        result = _ton_rpc("runGetMethod",
+                          {"address": wallet_address, "method": "seqno", "stack": []})
+        stack = result.get("stack") or []
+        if stack:
+            raw_value = stack[0][1] if isinstance(stack[0], (list, tuple)) else stack[0]
+            seqno = int(raw_value, 16) if isinstance(raw_value, str) else int(raw_value)
+    except Exception as exc:
+        logger.warning("TON: seqno не получен (%s) — пробую деплой кошелька", exc)
+        seqno = 0
+
+    extra = {}
+    if seqno == 0:
+        try:
+            extra["state_init"] = wallet.create_state_init()["state_init"]
+        except Exception as exc:
+            logger.warning("TON: state_init не собран (%s)", exc)
+
+    message = wallet.create_transfer_message(
+        to_address, int(amount_nano), seqno=seqno, payload=payload_b64 or "", **extra)
+    boc_b64 = bytes_to_b64str(message["message"].to_boc(False))
+    sent = _ton_rpc("sendBoc", {"boc": boc_b64})
+
+    tx_hash = str((sent or {}).get("hash") or boc_b64[:44])
+    logger.info("TON: транзакция отправлена с %s (seqno=%s), tx=%s",
+                wallet_address, seqno, tx_hash)
+    return {"success": True, "tx_id": tx_hash, "wallet": wallet_address}
+
+
 def _fragment_buy_direct(recipient: str, stars: int, frag_hash: str, cookies: str) -> dict:
     """Способ Б: прямой 3-шаговый поток fragment.com/api?hash=<hash>."""
     url = _fragment_endpoint(frag_hash)
@@ -1532,19 +1753,52 @@ def _fragment_buy_direct(recipient: str, stars: int, frag_hash: str, cookies: st
         'id': req_id,
     }, cookies)
     transaction = step3.get('transaction') or {}
+    messages = transaction.get('messages') or step3.get('messages') or []
+    first = messages[0] if messages else {}
+    to_address = (first.get('address') or transaction.get('address')
+                  or step3.get('address') or '')
+    try:
+        amount_nano = int(first.get('amount') or transaction.get('amount') or 0)
+    except (TypeError, ValueError):
+        amount_nano = 0
+    payload_b64 = (first.get('payload') or transaction.get('payload')
+                   or step3.get('payload') or '')
+
     link = (step3.get('link') or transaction.get('link')
             or (step3.get('data') or {}).get('link') or '')
     tx_id = link or req_id
 
-    if not (step3.get('ok') or step3.get('success') or link or step3.get('transaction')):
+    if not (step3.get('ok') or step3.get('success') or link or step3.get('transaction')
+            or to_address):
         error = step3.get('error') or step3.get('message') or "Fragment не вернул данные транзакции"
         logger.error("Fragment autobuy (direct): шаг 3 не удался для @%s: %s", username, error)
-        return {"success": False, "error": f"Транзакция: {error}"}
+        return {"success": False, "error": f"Транзакция: {error}",
+                "link": fragment_buy_page_link(username, stars)}
 
-    logger.info("Fragment autobuy (direct): %s ⭐ для @%s — запрос создан, tx=%s",
-                stars, username, tx_id)
-    return {"success": True, "tx_id": str(tx_id), "link": link,
-            "needs_payment": bool(link)}
+    # Персональная ссылка на оплату в 1 клик (Tonkeeper) либо страница Fragment
+    ton_link = tonkeeper_pay_link(to_address, amount_nano, payload_b64) if to_address else ""
+    pay_link = ton_link or link or fragment_buy_page_link(username, stars)
+
+    # Автооплата: если владелец задал TON-мнемонику — подписываем и шлём транзакцию сами
+    mnemonic = fragment_conf('ton_mnemonic')
+    if mnemonic and to_address and amount_nano > 0:
+        try:
+            sent = _ton_send_payment(mnemonic, to_address, amount_nano, payload_b64)
+            logger.info("Fragment autobuy (direct): %s ⭐ для @%s оплачено автоматически, tx=%s",
+                        stars, username, sent.get('tx_id'))
+            return {"success": True, "tx_id": str(sent.get('tx_id') or ''),
+                    "link": pay_link, "paid_automatically": True,
+                    "wallet": sent.get('wallet', '')}
+        except Exception as exc:
+            logger.exception("Fragment autobuy (direct): TON-перевод не отправлен: %s", exc)
+            return {"success": False,
+                    "error": f"TON-перевод не отправлен: {exc}",
+                    "link": pay_link}
+
+    logger.info("Fragment autobuy (direct): %s ⭐ для @%s — создана ссылка на оплату (мнемоника не задана)",
+                stars, username)
+    return {"success": True, "tx_id": str(tx_id), "link": pay_link,
+            "paid_automatically": False, "needs_payment": True}
 
 
 async def fragment_auto_buy(recipient_username: str, stars_amount: int) -> dict:
@@ -1627,6 +1881,7 @@ async def admin_approve(query, context, order_id):
         stars = 0
 
     autobuy_line = "ℹ️ Premium-заказ: выдаётся вручную."
+    result = {}
     if stars > 0:
         await query.edit_message_text(
             f"⏳ <b>Заказ #{order_id}: пробую автовыдачу через Fragment…</b>\n\n"
@@ -1636,17 +1891,25 @@ async def admin_approve(query, context, order_id):
         )
         result = await fragment_auto_buy(row['recipient'], stars)
         logger.info("Fragment autobuy по заказу #%s (%s ⭐): %s", order_id, stars, result)
-        if result.get('success'):
+        if result.get('success') and result.get('paid_automatically'):
             tx_id = html.escape(str(result.get('tx_id') or '—'))
-            autobuy_line = f"✅ Автовыдача Fragment: успешно (tx: <code>{tx_id}</code>)"
-            link = str(result.get('link') or '')
-            if link:
-                autobuy_line += (f"\n💎 Ссылка на оплату TON:\n"
-                                 f"<code>{html.escape(link)}</code>")
+            autobuy_line = (f"✅ Автовыдача Fragment: <b>оплачено автоматически</b>\n"
+                            f"🔗 tx: <code>{tx_id}</code>")
+        elif result.get('success'):
+            tx_id = html.escape(str(result.get('tx_id') or '—'))
+            autobuy_line = (f"✅ Автовыдача Fragment: счёт создан (tx: <code>{tx_id}</code>)\n"
+                            "💎 Осталось оплатить по кнопке ниже — 1 клик.")
         else:
             error = html.escape(str(result.get('error') or 'неизвестная ошибка'))
             autobuy_line = (f"⚠️ Автовыдача не выполнена: <i>{error}</i>\n"
-                            "Выдайте заказ вручную и проверьте настройки Fragment.")
+                            "Выдайте заказ по кнопке ниже и проверьте настройки Fragment.")
+
+    keyboard = []
+    if stars > 0:
+        keyboard.append([InlineKeyboardButton(
+            "💎 Выдать на Fragment в 1 клик",
+            url=str(result.get('link') or fragment_buy_page_link(row['recipient'], stars)))])
+    keyboard.append([InlineKeyboardButton("🔙 В админ-меню", callback_data='adm_back')])
 
     await query.edit_message_text(
         f"✅ <b>Заказ #{order_id} выполнен!</b>\n\n"
@@ -1654,7 +1917,8 @@ async def admin_approve(query, context, order_id):
         f"📦 {free_text_of(row)}\n"
         f"💰 {row['total']}₽\n\n"
         f"{autobuy_line}",
-        parse_mode='HTML'
+        parse_mode='HTML',
+        reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
     if row.get('buyer_id'):
@@ -1713,6 +1977,7 @@ def admin_menu_keyboard():
         [InlineKeyboardButton("🔘 Изменить названия кнопок (Блоков)", callback_data='adm_buttons_menu')],
         [InlineKeyboardButton("💳 Настроить ссылки оплаты", callback_data='adm_pay_links')],
         [InlineKeyboardButton("🤖 Автовыдача Fragment", callback_data='adm_fragment')],
+        [InlineKeyboardButton("☁️ Облако и База данных", callback_data='adm_cloud')],
         [InlineKeyboardButton("✨ Премиум-эмодзи в меню", callback_data='adm_emoji')]
     ]
 
@@ -2234,6 +2499,178 @@ async def admin_fragment_clear(query, context):
     await admin_fragment(query, context)
 
 
+# === Облако: БД, деплой, self-ping ===
+SELF_PING_INTERVAL = 480  # 8 минут — меньше 15 минут «сна» Render Free
+DEFAULT_SELF_PING_URL = "https://stars-seller-bot.onrender.com/"
+
+
+def self_ping_target() -> str:
+    """Внешний адрес сервиса для авто-пинга."""
+    return (os.getenv('RENDER_EXTERNAL_URL')
+            or get_setting('self_ping_url')
+            or DEFAULT_SELF_PING_URL).strip()
+
+
+def render_deploy_hook() -> str:
+    return (get_setting('render_deploy_hook')
+            or os.getenv('RENDER_DEPLOY_HOOK')
+            or '').strip()
+
+
+def self_ping_once() -> bool:
+    """Один GET-запрос по внешнему адресу сервиса (держит Render контейнер живым)."""
+    import urllib.request as _urlreq
+
+    url = self_ping_target()
+    try:
+        with _urlreq.urlopen(url, timeout=15) as response:
+            body = response.read(200).decode('utf-8', errors='replace')
+        logger.info("Self-ping OK: %s -> %s (%s)", url, getattr(response, 'status', 200), body[:80])
+        return True
+    except Exception as exc:
+        logger.warning("Self-ping не удался (%s): %s", url, exc)
+        return False
+
+
+def start_self_ping_loop():
+    """Демон-поток: раз в 8 минут бьёт по внешнему URL, чтобы Render Free не засыпал 24/7."""
+    def loop():
+        time.sleep(20)  # даём health-серверу подняться
+        while True:
+            try:
+                self_ping_once()
+            except Exception as exc:  # поток не должен падать ни при каких условиях
+                logger.warning("Self-ping: непредвиденная ошибка: %s", exc)
+            time.sleep(SELF_PING_INTERVAL)
+
+    target = self_ping_target()
+    logger.info("Self-ping 24/7 запущен: %s каждые %s сек", target, SELF_PING_INTERVAL)
+    threading.Thread(target=loop, daemon=True, name="self-ping").start()
+
+
+def trigger_render_deploy() -> dict:
+    """POST на Render Deploy Hook — перезапуск облака одной кнопкой из Telegram."""
+    import urllib.request as _urlreq
+
+    hook = render_deploy_hook()
+    if not hook.startswith('http'):
+        return {"success": False,
+                "error": "Deploy Hook не задан — /admin → ☁️ Облако и База данных"}
+    try:
+        request = _urlreq.Request(hook, data=b'', method='POST')
+        with _urlreq.urlopen(request, timeout=30) as response:
+            body = response.read(300).decode('utf-8', errors='replace')
+        logger.info("Render deploy hook вызван: %s %s", response.status, body[:150])
+        return {"success": True, "status": response.status, "response": body}
+    except Exception as exc:
+        logger.error("Render deploy hook не сработал: %s", exc)
+        return {"success": False, "error": f"{type(exc).__name__}: {exc}"}
+
+
+async def admin_cloud(query, context):
+    if query.from_user.id != ADMIN_ID:
+        await query.answer("⛔ Нет прав", show_alert=True)
+        return
+
+    context.user_data['state'] = ''
+    db_kind = "PostgreSQL (постоянная)" if DB_IS_POSTGRES else "SQLite (стирается при передеплое)"
+    hook = render_deploy_hook()
+    ping = self_ping_target()
+
+    await query.edit_message_text(
+        "☁️ <b>Облако и база данных</b>\n\n"
+        f"🗄 <b>База:</b> {db_kind}\n"
+        f"<code>{html.escape(mask_secret(DATABASE_URL) if DB_IS_POSTGRES else DB_NAME)}</code>\n\n"
+        f"🚀 <b>Deploy Hook:</b> <code>{html.escape(mask_secret(hook))}</code>\n"
+        f"📡 <b>Self-ping:</b> <code>{html.escape(ping)}</code>\n"
+        f"⏱ <b>Интервал:</b> каждые {SELF_PING_INTERVAL // 60} мин (Render не засыпает)\n\n"
+        "Нажмите кнопку и отправьте значение сообщением — ничего печатать вручную не нужно.",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🗄 Задать DATABASE_URL (Neon Postgres)",
+                                  callback_data='adm_set_db_url')],
+            [InlineKeyboardButton("🚀 Задать Render Deploy Hook",
+                                  callback_data='adm_set_deploy_hook')],
+            [InlineKeyboardButton("🔄 Перезапустить сервер Render",
+                                  callback_data='adm_restart_render')],
+            [InlineKeyboardButton("📡 Пропинговать сейчас", callback_data='adm_ping_now')],
+            [InlineKeyboardButton("🔙 Назад", callback_data='adm_back')],
+        ]),
+        parse_mode='HTML'
+    )
+
+
+async def admin_set_db_url(query, context):
+    if query.from_user.id != ADMIN_ID:
+        await query.answer("⛔ Нет прав", show_alert=True)
+        return
+    context.user_data['state'] = 'WAIT_DB_URL'
+    await query.edit_message_text(
+        "🗄 <b>DATABASE_URL (Neon Postgres)</b>\n\n"
+        f"Сейчас: <code>{html.escape(mask_secret(DATABASE_URL))}</code>\n\n"
+        "Отправьте строку подключения из Neon (начинается с <code>postgresql://</code>).\n"
+        "База подключится <b>сразу, без перезапуска</b>: заказы перестанут стираться.",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("🔙 К облаку", callback_data='adm_cloud')
+        ]]),
+        parse_mode='HTML'
+    )
+
+
+async def admin_set_deploy_hook(query, context):
+    if query.from_user.id != ADMIN_ID:
+        await query.answer("⛔ Нет прав", show_alert=True)
+        return
+    context.user_data['state'] = 'WAIT_DEPLOY_HOOK'
+    await query.edit_message_text(
+        "🚀 <b>Render Deploy Hook</b>\n\n"
+        f"Сейчас: <code>{html.escape(mask_secret(render_deploy_hook()))}</code>\n\n"
+        "Отправьте ссылку Deploy Hook из Render (вида "
+        "<code>https://api.render.com/deploy/srv-...?key=...</code>).\n"
+        "После этого кнопка «🔄 Перезапустить сервер Render» будет передеплоивать бот из Telegram.",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("🔙 К облаку", callback_data='adm_cloud')
+        ]]),
+        parse_mode='HTML'
+    )
+
+
+async def admin_restart_render(query, context):
+    if query.from_user.id != ADMIN_ID:
+        await query.answer("⛔ Нет прав", show_alert=True)
+        return
+    await query.answer("🚀 Отправляю запрос на передеплой…")
+    result = await asyncio.to_thread(trigger_render_deploy)
+    if result.get('success'):
+        await query.edit_message_text(
+            "🚀 <b>Передеплой Render запущен!</b>\n\n"
+            f"HTTP {result.get('status')}\n"
+            "Через 1–2 минуты сервис поднимется с новым кодом.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔙 К облаку", callback_data='adm_cloud')
+            ]]),
+            parse_mode='HTML'
+        )
+    else:
+        await query.edit_message_text(
+            f"⚠️ <b>Передеплой не запущен</b>\n\n<i>{html.escape(str(result.get('error')))}</i>",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🚀 Задать Deploy Hook", callback_data='adm_set_deploy_hook')
+            ], [
+                InlineKeyboardButton("🔙 К облаку", callback_data='adm_cloud')
+            ]]),
+            parse_mode='HTML'
+        )
+
+
+async def admin_ping_now(query, context):
+    if query.from_user.id != ADMIN_ID:
+        await query.answer("⛔ Нет прав", show_alert=True)
+        return
+    ok = await asyncio.to_thread(self_ping_once)
+    await query.answer("✅ Пинг прошёл — контейнер активен" if ok else "⚠️ Пинг не удался, смотрите лог",
+                       show_alert=True)
+
+
 # === Возврат в меню ===
 async def back_to_menu(query, context):
     context.user_data.clear()
@@ -2245,7 +2682,7 @@ async def back_to_menu(query, context):
 
 
 # === HealthCheck HTTP-сервер (для 24/7 бесплатного облачного хостинга) ===
-BOT_VERSION = "2026-10-28.4"
+BOT_VERSION = "2026-10-28.5"
 
 
 class HealthCheckHandler(BaseHTTPRequestHandler):
@@ -2269,12 +2706,14 @@ def start_health_server():
 # === Main ===
 def main():
     init_db()
+    ensure_database_from_settings()
     logger.info("Администратор (ADMIN_ID): %s", ADMIN_ID)
     logger.info(
         "Дефолты зашиты в код: %s экранов текста и %s кнопок — БД необязательна, "
         "settings используется как кэш правок", len(TEXT_DEFAULTS), len(BUTTON_DEFAULTS))
 
     threading.Thread(target=start_health_server, daemon=True).start()
+    start_self_ping_loop()
 
     app = Application.builder().token(TOKEN).build()
 
