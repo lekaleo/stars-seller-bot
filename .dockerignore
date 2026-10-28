@@ -1,0 +1,10 @@
+.git
+.gitignore
+.env
+*.db
+*.log
+run_*.txt
+__pycache__/
+*.pyc
+*.bat
+DEPLOY.md
