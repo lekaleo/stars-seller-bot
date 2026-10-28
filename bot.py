@@ -1524,6 +1524,7 @@ BOT_VERSION = "2026-10-28.2"
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
         self.end_headers()
         self.wfile.write(f"Bot is running 24/7 OK (v{BOT_VERSION})".encode())
 
