@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: stars-seller-bot
+    runtime: docker
+    plan: free
+    region: frankfurt
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /
+    autoDeploy: true
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: ADMIN_ID
+        value: "481441820"
+      - key: SBP_PAYMENT_URL
+        sync: false
+      - key: CARD_PAYMENT_URL
+        sync: false
+      - key: CRYPTO_PAYMENT_URL
+        sync: false

@@ -1,8 +1,12 @@
 import os
 import re
+import html
 import time
 import logging
 import sqlite3
+
+from http.server import BaseHTTPRequestHandler, HTTPServer
+import threading
 
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -14,7 +18,6 @@ from telegram.ext import (
 # === Пути и логирование в папку проекта ===
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 LOG_FILE = os.path.join(BASE_DIR, "bot.log")
-DB_NAME = os.path.join(BASE_DIR, "bot.db")
 ENV_FILE = os.path.join(BASE_DIR, ".env")
 
 logging.basicConfig(
@@ -33,6 +36,10 @@ logging.getLogger("telegram").setLevel(logging.WARNING)
 load_dotenv()
 load_dotenv(ENV_FILE)
 
+# Путь к БД: на облачных хостингах можно указать DB_PATH (например, на persistent disk),
+# иначе — bot.db рядом с bot.py
+DB_NAME = os.getenv("DB_PATH") or os.path.join(BASE_DIR, "bot.db")
+
 TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "481441820"))
 SBP_PAYMENT_URL = os.getenv("SBP_PAYMENT_URL", "https://pay.platega.io/sbp_placeholder")
@@ -49,15 +56,144 @@ REVIEWS_LINK = "https://t.me/starsdefolt"
 
 USERNAME_RE = re.compile(r"^@[a-zA-Z0-9_]{5,32}$")
 
-MAIN_TEXT_TEMPLATE = """⚡ <b>Telegram Stars &amp; Premium — быстро и выгодно</b>
+# === Редактируемые тексты всех экранов (стандартные = утверждённые владельцем 28.10.2026) ===
+TEXT_DEFAULTS = {
+    'welcome': ('<tg-emoji emoji-id="5875465628285931233">✈️</tg-emoji><b>Добро пожаловать!</b>\n'
+                '<b><i>Здесь вы можете быстро приобрести Telegram Stars и Premium подписку на свой аккаунт</i></b>\n'
+                '<blockquote><tg-emoji emoji-id="5936259309812846957">⭐️</tg-emoji><b>{rate}₽/звезда</b>.\n'
+                '<b><tg-emoji emoji-id="5778202206922608769">🔄</tg-emoji></b><b>1–2 минуты по </b><b>@username</b><b>.</b>\n'
+                '<tg-emoji emoji-id="6019523512908124649">🔒</tg-emoji><b> Без входа в аккаунт.</b></blockquote>\n'
+                '<tg-emoji emoji-id="5874960879434338403">🔎</tg-emoji> <b>Выберите нужный раздел:</b>'),
+    'stars_prompt': '<tg-emoji emoji-id="5879841310902324730">✏️</tg-emoji> Введите ваш @username в <b>Telegram</b>:',
+    'stars_options': ('<tg-emoji emoji-id="5936259309812846957">⭐️</tg-emoji> <b>Покупка Telegram stars</b> \n\n'
+                      '<tg-emoji emoji-id="5954175920506933873">👤</tg-emoji> Получатель: {recipient}\n \n'
+                      '<blockquote>Выберите готовый пакет или укажите любое кол-во звезд текстом '
+                      '<tg-emoji emoji-id="5877307202888273539">📥</tg-emoji>(от {min} до {max})</blockquote>'),
+    'stars_custom': "Укажите любое количество звёзд (чётное, от {min} до {max}):",
+    'stars_order': ('<tg-emoji emoji-id="5936259309812846957">⭐️</tg-emoji> Информация о заказе {order_id}\n\n'
+                    '<tg-emoji emoji-id="5879770735999717115">👤</tg-emoji> Получатель: {recipient}\n'
+                    '<tg-emoji emoji-id="5958413064658228696">⭐️</tg-emoji> Количество звезд: {stars} \n'
+                    '<tg-emoji emoji-id="5778318458802409852">💰</tg-emoji> Курс: {rate}₽ за звезду \n'
+                    '<tg-emoji emoji-id="5811989245761426317">💰</tg-emoji> Стоимость: {total}₽'),
+    'premium_prompt': '<tg-emoji emoji-id="5989981173068077484">⭐️</tg-emoji> Введите @username получателя Telegram Premium:',
+    'premium_tariffs': ('<tg-emoji emoji-id="5879770735999717115">👤</tg-emoji> Получатель: {recipient}\n\n'
+                        '<tg-emoji emoji-id="5839394435644788150">⭐️</tg-emoji> Выберите тариф Telegram Premium:'),
+    'premium_order': ('<tg-emoji emoji-id="5989981173068077484">⭐️</tg-emoji> Информация о заказе #{order_id} \n\n'
+                      '<tg-emoji emoji-id="5954175920506933873">👤</tg-emoji> Получатель: {recipient} \n'
+                      '<tg-emoji emoji-id="5839116473951328489">⭐️</tg-emoji> Тариф: Telegram Premium на {months} мес.\n'
+                      '<tg-emoji emoji-id="5811989245761426317">💰</tg-emoji> Стоимость: {total}₽'),
+    'reviews_text': ('<tg-emoji emoji-id="5884510167986343350">💬</tg-emoji><b> Отзывы покупателей </b>\n'
+                     '<blockquote>Нажмите кнопку ниже, чтобы перейти на наш канал с отзывами: @starsdefolt</blockquote>'),
+    'payment_menu': ('<tg-emoji emoji-id="5927169041595634481">💳</tg-emoji> <b>Оплата </b>\n\n'
+                     '<tg-emoji emoji-id="5967548335542767952">💳</tg-emoji> Заказ #{order_id}\n'
+                     '<tg-emoji emoji-id="5985472565508838112">🎁</tg-emoji> {item_title} \n'
+                     '<tg-emoji emoji-id="5811989245761426317">💰</tg-emoji> Сумма к оплате: {total}₽'),
+    'payment_sbp_text': ('<tg-emoji emoji-id="5927169041595634481">💳</tg-emoji><b> Оплата СБП </b>\n\n'
+                         '<tg-emoji emoji-id="5811989245761426317">💰</tg-emoji> Сумма: {total}₽'),
+    'payment_card_text': ('<tg-emoji emoji-id="5927169041595634481">💳</tg-emoji><b> Оплата банковской картой (РФ) </b>\n\n'
+                          '<tg-emoji emoji-id="5811989245761426317">💰</tg-emoji> Сумма: {total}₽'),
+    'payment_crypto_text': ('<tg-emoji emoji-id="5807499888245612254">💎</tg-emoji><b> Оплата криптовалютой (USDT / TON)</b> \n\n'
+                            '<tg-emoji emoji-id="5811989245761426317">💰</tg-emoji> Сумма: {total}₽'),
+    'paid_wait_text': ('<tg-emoji emoji-id="5778202206922608769">🔄</tg-emoji> <b>Заявка на проверку оплаты отправлена! </b>\n'
+                       '<blockquote>Администратор проверит поступление средств и начислит ваш заказ в ближайшее время</blockquote>'),
+}
 
-🔥 <b>Курс {rate}₽ за звезду</b> — дешевле, чем в других ботах!
-🚀 <b>Моментально</b> — зачисление по @username за 1–2 минуты.
-🛡 <b>Безопасно</b> — без входа в аккаунт и лишних данных.
-💳 <b>Любая оплата</b> — СБП, карты РФ, криптовалюта.
-💬 <b>Нам доверяют</b> — отзывы клиентов: @starsdefolt
+# Доступные переменные по экранам (для подсказок в редакторе)
+SCREEN_VARS = {
+    'welcome': '{rate} — текущий курс звезды',
+    'stars_prompt': '(без переменных)',
+    'stars_options': '{recipient}, {rate}, {min}, {max}',
+    'stars_custom': '{min}, {max}',
+    'stars_order': '{order_id}, {recipient}, {stars}, {rate}, {total}',
+    'premium_prompt': '(без переменных)',
+    'premium_tariffs': '{recipient}',
+    'premium_order': '{order_id}, {recipient}, {months}, {total}',
+    'reviews_text': '(без переменных)',
+    'payment_menu': '{order_id}, {item_title}, {total}',
+    'payment_sbp_text': '{total}',
+    'payment_card_text': '{total}',
+    'payment_crypto_text': '{total}',
+    'paid_wait_text': '(без переменных)',
+}
 
-👇 <b>Выберите нужный раздел:</b>"""
+SCREEN_TITLES = {
+    'welcome': '🏠 Главный экран (/start)',
+    'stars_prompt': '🌟 Звёзды: ввод @username',
+    'stars_options': '🌟 Звёзды: выбор пакета',
+    'stars_custom': '🌟 Звёзды: ручной ввод кол-ва',
+    'stars_order': '🌟 Звёзды: карточка заказа',
+    'premium_prompt': '💎 Premium: ввод @username',
+    'premium_tariffs': '💎 Premium: выбор тарифа',
+    'premium_order': '💎 Premium: карточка заказа',
+    'reviews_text': '⭐ Отзывы: пост раздела',
+    'payment_menu': '💳 Оплата: выбор способа',
+    'payment_sbp_text': '💳 Оплата: СБП',
+    'payment_card_text': '💳 Оплата: Карта РФ',
+    'payment_crypto_text': '💳 Оплата: Криптовалюта',
+    'paid_wait_text': '⏳ Пост «Я оплатил» (ожидание)',
+}
+
+
+def screen_text(key: str, **variables) -> str:
+    """Текст экрана: settings['txt_<key>'] -> custom_welcome_text (welcome) -> TEXT_DEFAULTS.
+    Подстановка переменных через .replace() — отсутствие {var} в тексте не вызывает ошибку."""
+    text = get_setting('txt_' + key)
+    if text is None and key == 'welcome':
+        text = get_setting('custom_welcome_text')  # обратная совместимость (ШАГ 4)
+    if text is None:
+        text = TEXT_DEFAULTS[key]
+    for var, val in variables.items():
+        text = text.replace('{' + var + '}', str(val))
+    return text
+
+
+# === Редактируемые названия кнопок (ШАГ 2) ===
+BUTTON_DEFAULTS = {
+    'btn_main_stars': "⭐️ Звёзды",
+    'btn_main_premium': "⭐️ Telegram Premium",
+    'btn_main_reviews': "💬 Отзывы",
+    'btn_stars_100': "🌟 100 звёзд ({price}₽)",
+    'btn_stars_1000': "🌟 1000 звёзд ({price}₽)",
+    'btn_stars_10000': "🌟 10000 звёзд ({price}₽)",
+    'btn_prem_3': "💎 3 месяца — 1390₽",
+    'btn_prem_6': "💎 6 месяцев — 1850₽",
+    'btn_prem_12': "🔥 12 месяцев — 3190₽ (Выгодно)",
+    'btn_pay_sbp': "💸 СБП (Система Быстрых Платежей)",
+    'btn_pay_card': "💳 Банковская карта (РФ)",
+    'btn_pay_crypto': "💎 Криптовалюта (USDT / TON / BTC)",
+    'btn_reviews_url': "📢 Перейти к отзывам",
+}
+
+BUTTON_TITLES = {
+    'btn_main_stars': '1-й блок главного меню',
+    'btn_main_premium': '2-й блок главного меню',
+    'btn_main_reviews': '3-й блок главного меню',
+    'btn_stars_100': 'Пакет 100 звёзд ({price} = курс × 100)',
+    'btn_stars_1000': 'Пакет 1000 звёзд',
+    'btn_stars_10000': 'Пакет 10000 звёзд',
+    'btn_prem_3': 'Premium 3 месяца',
+    'btn_prem_6': 'Premium 6 месяцев',
+    'btn_prem_12': 'Premium 12 месяцев',
+    'btn_pay_sbp': 'Кнопка способа оплаты: СБП',
+    'btn_pay_card': 'Кнопка способа оплаты: Карта РФ',
+    'btn_pay_crypto': 'Кнопка способа оплаты: Крипта',
+    'btn_reviews_url': 'Кнопка перехода в канал отзывов',
+}
+
+BUTTON_VARS = {
+    'btn_stars_100': '{price}', 'btn_stars_1000': '{price}', 'btn_stars_10000': '{price}',
+}
+
+
+def btn_label(key: str, **variables) -> str:
+    """Название кнопки: settings['btn_<key>'] -> BUTTON_DEFAULTS.
+    Очищается от любых HTML-тегов (в т.ч. <tg-emoji>) и HTML-сущностей — в кнопках они недопустимы."""
+    label = get_setting('btn_' + key) or BUTTON_DEFAULTS[key]
+    label = re.sub(r'<[^>]+>', '', label)
+    label = html.unescape(label).strip()
+    for var, val in variables.items():
+        label = label.replace('{' + var + '}', str(val))
+    return label
 
 
 def get_rate() -> float:
@@ -80,21 +216,14 @@ def get_menu_emoji() -> tuple:
 def main_text() -> str:
     emoji_id, fallback = get_menu_emoji()
     prefix = f'<tg-emoji emoji-id="{emoji_id}">{fallback}</tg-emoji> ' if emoji_id else ''
-
-    # Кастомный текст приветствия из БД (задаётся в /admin → "Изменить текст приветствия")
-    custom = get_setting('custom_welcome_text')
-    if custom:
-        body = custom.replace('{rate}', f'{get_rate():g}')
-    else:
-        body = MAIN_TEXT_TEMPLATE.format(rate=get_rate())
-    return prefix + body
+    return prefix + screen_text('welcome', rate=f'{get_rate():g}')
 
 
 def main_keyboard():
     return [
-        [InlineKeyboardButton("🌟 Купить Звёзды", callback_data='catalog_stars')],
-        [InlineKeyboardButton("💎 Telegram Premium", callback_data='catalog_premium')],
-        [InlineKeyboardButton("⭐ Отзывы покупателей", callback_data='reviews')]
+        [InlineKeyboardButton(btn_label('btn_main_stars'), callback_data='catalog_stars')],
+        [InlineKeyboardButton(btn_label('btn_main_premium'), callback_data='catalog_premium')],
+        [InlineKeyboardButton(btn_label('btn_main_reviews'), callback_data='reviews')]
     ]
 
 
@@ -229,8 +358,10 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         'adm_rate': admin_rate,
         'adm_emoji': admin_emoji,
         'adm_emoji_clear': admin_emoji_clear,
-        'adm_edit_text': admin_edit_text,
-        'adm_reset_text': admin_reset_text,
+        'adm_edit_text': admin_edit_text,  # совместимость: эквивалент редактирования welcome
+        'adm_reset_text': admin_reset_text,  # совместимость: сброс welcome
+        'adm_texts_menu': admin_texts_menu,
+        'adm_buttons_menu': admin_buttons_menu,
         'adm_pay_links': admin_pay_links,
         'adm_back': admin_back,
     }
@@ -253,6 +384,26 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if order_id.isdigit():
             await admin_reject(query, context, int(order_id))
             return
+    elif data.startswith('adm_txtrst_'):
+        key = data.split('adm_txtrst_', 1)[1]
+        if key in TEXT_DEFAULTS:
+            await admin_text_reset(query, context, key)
+            return
+    elif data.startswith('adm_txt_'):
+        key = data.split('adm_txt_', 1)[1]
+        if key in TEXT_DEFAULTS:
+            await admin_edit_screen(query, context, key)
+            return
+    elif data.startswith('adm_btnrst_'):
+        key = data.split('adm_btnrst_', 1)[1]
+        if key in BUTTON_DEFAULTS:
+            await admin_button_reset(query, context, key)
+            return
+    elif data.startswith('adm_btn_'):
+        key = data.split('adm_btn_', 1)[1]
+        if key in BUTTON_DEFAULTS:
+            await admin_edit_button(query, context, key)
+            return
 
     handler = handlers.get(data)
     if handler:
@@ -266,8 +417,9 @@ async def show_catalog_prompt(query, context):
         [InlineKeyboardButton("🔙 Назад", callback_data='back')]
     ]
     await query.message.edit_text(
-        "🌟 Введите ваш @username в Telegram:",
-        reply_markup=InlineKeyboardMarkup(keyboard)
+        screen_text('stars_prompt'),
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode='HTML'
     )
 
 
@@ -277,7 +429,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Премиум-эмодзи от владельца: сначала проверяем режим установки, потом эхо
     if (user.id == ADMIN_ID and update.message.entities
-            and state not in ('WAIT_WELCOME_TEXT',)):
+            and state not in ('WAIT_WELCOME_TEXT', 'WAIT_SCREEN_TEXT', 'WAIT_BUTTON_TEXT')):
         custom_entities = [
             e for e in update.message.entities
             if e.type == 'custom_emoji' and getattr(e, 'custom_emoji_id', None)
@@ -354,22 +506,47 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode='HTML'
         )
 
-    elif state == 'WAIT_WELCOME_TEXT':
+    elif state == 'WAIT_SCREEN_TEXT':
         if user.id != ADMIN_ID:
             await update.message.reply_text("⛔ Нет прав.")
             return
+        key = context.user_data.get('edit_key')
+        if key not in TEXT_DEFAULTS:
+            context.user_data['state'] = ''
+            return
         # text_html сохраняет жирный/курсив/ссылки и теги <tg-emoji>
-        html = update.message.text_html
-        if not html:
+        text_html = update.message.text_html
+        if not text_html:
             await update.message.reply_text("❌ Отправьте текстовое сообщение.")
             return
-        set_setting('custom_welcome_text', html)
+        set_setting('txt_' + key, text_html)
         context.user_data['state'] = ''
-        logger.info("Админ %s обновил текст приветствия (%s символов)", user.id, len(html))
+        logger.info("Админ %s обновил текст экрана '%s' (%s символов)", user.id, key, len(text_html))
         await update.message.reply_text(
-            "✅ <b>Текст приветствия обновлён!</b>\n\n"
-            "Проверьте командой /start. Кнопка «🔄 Сбросить текст по умолчанию» "
-            "вернёт стандартный шаблон.",
+            f"✅ <b>Текст экрана «{SCREEN_TITLES[key]}» обновлён!</b>\n\n"
+            "Проверьте соответствующий раздел бота. Изменения применяются сразу.",
+            parse_mode='HTML'
+        )
+
+    elif state == 'WAIT_BUTTON_TEXT':
+        if user.id != ADMIN_ID:
+            await update.message.reply_text("⛔ Нет прав.")
+            return
+        key = context.user_data.get('edit_key')
+        if key not in BUTTON_DEFAULTS:
+            context.user_data['state'] = ''
+            return
+        # Названия кнопок — чистый текст: Telegram не поддерживает <tg-emoji> в кнопках
+        new_label = re.sub(r'<[^>]+>', '', text_in).strip()
+        if not new_label:
+            await update.message.reply_text("❌ Отправьте текстовое сообщение.")
+            return
+        set_setting('btn_' + key, new_label)
+        context.user_data['state'] = ''
+        logger.info("Админ %s обновил название кнопки '%s': %s", user.id, key, new_label)
+        await update.message.reply_text(
+            f"✅ <b>Название кнопки «{BUTTON_TITLES[key]}» обновлено!</b>\n\n"
+            f"Новое название: {html.escape(new_label)}",
             parse_mode='HTML'
         )
 
@@ -424,27 +601,25 @@ async def show_star_options(query_or_update, context):
     username = context.user_data.get('recipient', '@----')
     rate = get_rate()
     keyboard = [
-        [InlineKeyboardButton(f"🌟 100 звёзд ({round(100 * rate, 2):g}₽)", callback_data='stars_100')],
-        [InlineKeyboardButton(f"🌟 1000 звёзд ({round(1000 * rate, 2):g}₽)", callback_data='stars_1000')],
-        [InlineKeyboardButton(f"🌟 10000 звёзд ({round(10000 * rate, 2):g}₽)", callback_data='stars_10000')],
+        [InlineKeyboardButton(btn_label('btn_stars_100', price=f'{round(100 * rate, 2):g}'), callback_data='stars_100')],
+        [InlineKeyboardButton(btn_label('btn_stars_1000', price=f'{round(1000 * rate, 2):g}'), callback_data='stars_1000')],
+        [InlineKeyboardButton(btn_label('btn_stars_10000', price=f'{round(10000 * rate, 2):g}'), callback_data='stars_10000')],
         [InlineKeyboardButton("🔙 Назад", callback_data='back')]
     ]
 
-    text = (
-        f"✅ Получатель: {username}\n\n"
-        "Выберите готовый пакет или укажите любое количество звёзд "
-        f"(чётное число, от {MIN_STARS} до {MAX_STARS}) ответом в чат "
-        f"(курс: {get_rate()}₽/звезда):"
+    text = screen_text(
+        'stars_options',
+        recipient=username, rate=f'{rate:g}', min=MIN_STARS, max=MAX_STARS
     )
 
     context.user_data['state'] = 'WAIT_STARS'
 
     if hasattr(query_or_update, 'edit_message_text'):
-        await query_or_update.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+        await query_or_update.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
     elif hasattr(query_or_update, 'message') and query_or_update.message:
-        await query_or_update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+        await query_or_update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
     else:
-        await query_or_update.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+        await query_or_update.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
 
 
 async def select_stars(query, context, count):
@@ -458,8 +633,9 @@ async def stars_custom(query, context):
         [InlineKeyboardButton("🔙 Назад", callback_data='back')]
     ]
     await query.message.edit_text(
-        f"Укажите любое количество звёзд (чётное, от {MIN_STARS} до {MAX_STARS}):",
-        reply_markup=InlineKeyboardMarkup(keyboard)
+        screen_text('stars_custom', min=MIN_STARS, max=MAX_STARS),
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode='HTML'
     )
 
 
@@ -497,12 +673,11 @@ async def calculate_cost(update_or_query, context):
         order_id, buyer, recipient, stars, rate, total
     )
 
-    text = f"""🌟 <b>Информация о заказе</b> #{order_id}
-
-👤 Получатель: <code>{recipient}</code>
-🔢 Количество звёзд: {stars}
-💱 Курс: {rate}₽ за звезду
-💰 <b>Стоимость: {total}₽</b>"""
+    text = screen_text(
+        'stars_order',
+        order_id=order_id, recipient=recipient, stars=stars,
+        rate=f'{rate:g}', total=f'{total:g}'
+    )
 
     keyboard = [
         [InlineKeyboardButton("🔄 Изменить количество", callback_data='stars_custom')],
@@ -528,29 +703,30 @@ async def show_premium_prompt(query, context):
         [InlineKeyboardButton("🔙 Назад", callback_data='back')]
     ]
     await query.message.edit_text(
-        "💎 Введите @username получателя Telegram Premium:",
-        reply_markup=InlineKeyboardMarkup(keyboard)
+        screen_text('premium_prompt'),
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode='HTML'
     )
 
 
 async def show_premium_tariffs(query_or_update, context):
     username = context.user_data.get('recipient', '@----')
     keyboard = [
-        [InlineKeyboardButton("💎 3 месяца — 1390₽", callback_data='prem_3_1390')],
-        [InlineKeyboardButton("💎 6 месяцев — 1850₽", callback_data='prem_6_1850')],
-        [InlineKeyboardButton("🔥 12 месяцев — 3190₽ (Выгодно)", callback_data='prem_12_3190')],
+        [InlineKeyboardButton(btn_label('btn_prem_3'), callback_data='prem_3_1390')],
+        [InlineKeyboardButton(btn_label('btn_prem_6'), callback_data='prem_6_1850')],
+        [InlineKeyboardButton(btn_label('btn_prem_12'), callback_data='prem_12_3190')],
         [InlineKeyboardButton("🔙 Назад", callback_data='back')]
     ]
 
-    text = f"✅ Получатель: {username}\n\n💎 Выберите тариф Telegram Premium:"
+    text = screen_text('premium_tariffs', recipient=username)
     context.user_data['state'] = ''
 
     if hasattr(query_or_update, 'edit_message_text'):
-        await query_or_update.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+        await query_or_update.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
     elif hasattr(query_or_update, 'message') and query_or_update.message:
-        await query_or_update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+        await query_or_update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
     else:
-        await query_or_update.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+        await query_or_update.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
 
 
 async def select_premium(query, context, months, price):
@@ -583,11 +759,10 @@ async def select_premium(query, context, months, price):
         order_id, buyer, recipient, months, price
     )
 
-    text = f"""💎 <b>Информация о заказе</b> #{order_id}
-
-👤 Получатель: <code>{recipient}</code>
-📦 Тариф: Telegram Premium на {months} мес.
-💰 <b>Стоимость: {price}₽</b>"""
+    text = screen_text(
+        'premium_order',
+        order_id=order_id, recipient=recipient, months=months, total=f'{price:g}'
+    )
 
     keyboard = [
         [InlineKeyboardButton("💳 Перейти к оплате", callback_data='payment')],
@@ -599,11 +774,9 @@ async def select_premium(query, context, months, price):
 
 # === Блок 3: Отзывы ===
 async def show_reviews(query, context):
-    text = """⭐ <b>Отзывы покупателей</b>
-
-Нажмите кнопку ниже, чтобы перейти на наш канал с отзывами:"""
+    text = screen_text('reviews_text')
     keyboard = [
-        [InlineKeyboardButton("📢 Перейти к отзывам", url=REVIEWS_LINK)],
+        [InlineKeyboardButton(btn_label('btn_reviews_url'), url=REVIEWS_LINK)],
         [InlineKeyboardButton("🔙 Назад", callback_data='back')]
     ]
     await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
@@ -624,18 +797,12 @@ async def show_payment(query, context):
         return
 
     item_title = context.user_data.get('item_title', '')
-    text = f"""💳 <b>Оплата</b>
-
-🧾 Заказ #{order_id}
-📦 {item_title}
-💰 <b>Сумма к оплате: {total}₽</b>
-
-Выберите удобный способ оплаты — вся оплата проходит на защищённой странице кассы:"""
+    text = screen_text('payment_menu', order_id=order_id, item_title=item_title, total=f'{total:g}')
 
     keyboard = [
-        [InlineKeyboardButton("💸 СБП (Система Быстрых Платежей)", callback_data='payment_sbp')],
-        [InlineKeyboardButton("💳 Банковская карта (РФ)", callback_data='payment_card')],
-        [InlineKeyboardButton("💎 Криптовалюта (USDT / TON / BTC)", callback_data='payment_crypto')],
+        [InlineKeyboardButton(btn_label('btn_pay_sbp'), callback_data='payment_sbp')],
+        [InlineKeyboardButton(btn_label('btn_pay_card'), callback_data='payment_card')],
+        [InlineKeyboardButton(btn_label('btn_pay_crypto'), callback_data='payment_crypto')],
         [InlineKeyboardButton("🔙 Назад", callback_data='back')]
     ]
     await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
@@ -658,8 +825,7 @@ async def payment_sbp(query, context):
         [InlineKeyboardButton("🔙 Назад", callback_data='payment')]
     ]
     await query.edit_message_text(
-        f"💸 <b>Оплата через СБП</b>\n\n💰 Сумма: {total}₽\n\n"
-        "Нажмите кнопку ниже, чтобы перейти на защищённую страницу оплаты.",
+        screen_text('payment_sbp_text', total=f'{total:g}'),
         reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
 
 
@@ -675,8 +841,7 @@ async def payment_card(query, context):
         [InlineKeyboardButton("🔙 Назад", callback_data='payment')]
     ]
     await query.edit_message_text(
-        f"💳 <b>Оплата банковской картой (РФ)</b>\n\n💰 Сумма: {total}₽\n\n"
-        "Нажмите кнопку ниже, чтобы перейти на защищённую страницу оплаты.",
+        screen_text('payment_card_text', total=f'{total:g}'),
         reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
 
 
@@ -692,8 +857,7 @@ async def payment_crypto(query, context):
         [InlineKeyboardButton("🔙 Назад", callback_data='payment')]
     ]
     await query.edit_message_text(
-        f"💎 <b>Оплата криптовалютой (USDT / TON / BTC)</b>\n\n💰 Сумма: {total}₽\n\n"
-        "Нажмите кнопку ниже, чтобы перейти на защищённую страницу оплаты.",
+        screen_text('payment_crypto_text', total=f'{total:g}'),
         reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
 
 
@@ -788,8 +952,7 @@ async def customer_paid(query, context, order_id):
     logger.info("Заказ #%s отправлен на проверку (waiting_check)", order_id)
 
     await query.edit_message_text(
-        "⏳ <b>Заявка на проверку оплаты отправлена!</b>\n"
-        "Администратор проверит поступление средств и начислит ваш заказ в ближайшее время.",
+        screen_text('paid_wait_text', order_id=order_id),
         parse_mode='HTML'
     )
 
@@ -891,8 +1054,8 @@ def admin_menu_keyboard():
         [InlineKeyboardButton("⏳ Заказы на проверке", callback_data='adm_pending')],
         [InlineKeyboardButton("📊 Статистика бота", callback_data='adm_stats')],
         [InlineKeyboardButton("💱 Изменить курс звезды", callback_data='adm_rate')],
-        [InlineKeyboardButton("📝 Изменить текст приветствия", callback_data='adm_edit_text')],
-        [InlineKeyboardButton("🔄 Сбросить текст по умолчанию", callback_data='adm_reset_text')],
+        [InlineKeyboardButton("📝 Редактор текстов (Все экраны)", callback_data='adm_texts_menu')],
+        [InlineKeyboardButton("🔘 Изменить названия кнопок (Блоков)", callback_data='adm_buttons_menu')],
         [InlineKeyboardButton("💳 Настроить ссылки оплаты", callback_data='adm_pay_links')],
         [InlineKeyboardButton("✨ Премиум-эмодзи в меню", callback_data='adm_emoji')]
     ]
@@ -1086,38 +1249,155 @@ async def admin_emoji_clear(query, context):
     )
 
 
-async def admin_edit_text(query, context):
+# === Редактор текстов всех экранов (ШАГ 3.1) ===
+async def admin_texts_menu(query, context):
     if query.from_user.id != ADMIN_ID:
         await query.answer("⛔ Нет прав", show_alert=True)
         return
 
-    context.user_data['state'] = 'WAIT_WELCOME_TEXT'
+    keyboard = []
+    for key in TEXT_DEFAULTS:
+        customized = "✏️ " if get_setting('txt_' + key) or (
+            key == 'welcome' and get_setting('custom_welcome_text')) else ""
+        keyboard.append([InlineKeyboardButton(
+            f"{customized}{SCREEN_TITLES[key]}", callback_data=f'adm_txt_{key}')])
+    keyboard.append([InlineKeyboardButton("🔙 В админ-меню", callback_data='adm_back')])
+
     await query.edit_message_text(
-        "📝 <b>Редактор стартового сообщения</b>\n\n"
-        "Отправьте в чат новый текст приветствия именно в том виде, "
-        "как его должны видеть покупатели.\n\n"
-        "💡 Вы можете использовать прямо в Telegram: <b>жирный шрифт</b>, "
-        "<i>курсив</i>, ссылки и любые <b>Премиум-эмодзи</b>!\n"
-        "Чтобы в тексте автоматически подставлялся актуальный курс, "
-        "напишите <code>{rate}</code> (или просто укажите цифру).",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data='adm_back')]]),
+        "📝 <b>Редактор текстов — все экраны бота</b>\n\n"
+        "Выберите экран, текст которого хотите изменить.\n"
+        "✏️ — текст уже изменён вами.",
+        reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode='HTML'
     )
+
+
+async def admin_edit_screen(query, context, key):
+    if query.from_user.id != ADMIN_ID:
+        await query.answer("⛔ Нет прав", show_alert=True)
+        return
+
+    context.user_data['state'] = 'WAIT_SCREEN_TEXT'
+    context.user_data['edit_key'] = key
+
+    saved = get_setting('txt_' + key)
+    if saved is None and key == 'welcome':
+        saved = get_setting('custom_welcome_text')
+    current = saved if saved is not None else TEXT_DEFAULTS[key]
+    status = "✏️ изменён вами" if saved is not None else "стандартный"
+
+    await query.edit_message_text(
+        f"📝 <b>{SCREEN_TITLES[key]}</b>\n\n"
+        f"<b>Текущий текст</b> ({status}):\n"
+        f"───────────────\n{current}\n"
+        f"───────────────\n\n"
+        f"<b>Доступные переменные:</b> <code>{SCREEN_VARS[key]}</code>\n\n"
+        "Отправьте в чат новый текст — можно прямо в Telegram оформить его: "
+        "<b>жирный</b>, <i>курсив</i>, цитаты, ссылки и любые <b>Премиум-эмодзи</b>!\n"
+        "Переменные подставятся автоматически (если уберёте их из текста — просто не будет подстановки).",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("🔄 Сбросить этот текст по умолчанию", callback_data=f'adm_txtrst_{key}')
+        ], [
+            InlineKeyboardButton("🔙 К списку экранов", callback_data='adm_texts_menu')
+        ]]),
+        parse_mode='HTML'
+    )
+
+
+async def admin_text_reset(query, context, key):
+    if query.from_user.id != ADMIN_ID:
+        await query.answer("⛔ Нет прав", show_alert=True)
+        return
+
+    delete_setting('txt_' + key)
+    if key == 'welcome':
+        delete_setting('custom_welcome_text')  # сбрасываем и старый ключ
+    context.user_data['state'] = ''
+    logger.info("Админ %s сбросил текст экрана '%s' на стандартный", query.from_user.id, key)
+    await query.edit_message_text(
+        f"🔄 Текст экрана «{SCREEN_TITLES[key]}» сброшен на стандартный.",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("🔙 К списку экранов", callback_data='adm_texts_menu')
+        ]]),
+        parse_mode='HTML'
+    )
+
+
+# === Редактор названий кнопок (ШАГ 3.2) ===
+async def admin_buttons_menu(query, context):
+    if query.from_user.id != ADMIN_ID:
+        await query.answer("⛔ Нет прав", show_alert=True)
+        return
+
+    keyboard = []
+    for key in BUTTON_DEFAULTS:
+        customized = "✏️ " if get_setting('btn_' + key) else ""
+        keyboard.append([InlineKeyboardButton(
+            f"{customized}{BUTTON_TITLES[key]}", callback_data=f'adm_btn_{key}')])
+    keyboard.append([InlineKeyboardButton("🔙 В админ-меню", callback_data='adm_back')])
+
+    await query.edit_message_text(
+        "🔘 <b>Изменение названий кнопок (блоков)</b>\n\n"
+        "Выберите кнопку, название которой хотите изменить.\n"
+        "✏️ — название уже изменено вами.",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode='HTML'
+    )
+
+
+async def admin_edit_button(query, context, key):
+    if query.from_user.id != ADMIN_ID:
+        await query.answer("⛔ Нет прав", show_alert=True)
+        return
+
+    context.user_data['state'] = 'WAIT_BUTTON_TEXT'
+    context.user_data['edit_key'] = key
+
+    saved = get_setting('btn_' + key)
+    current = btn_label(key)  # уже очищено от HTML-тегов — в кнопках теги недопустимы
+    status = "✏️ изменено вами" if saved is not None else "стандартное"
+    vars_hint = f"\n\n<b>Переменные:</b> <code>{BUTTON_VARS[key]}</code>" if key in BUTTON_VARS else ""
+
+    await query.edit_message_text(
+        f"🔘 <b>{BUTTON_TITLES[key]}</b>\n\n"
+        f"<b>Текущее название</b> ({status}):\n"
+        f"{html.escape(current)}{vars_hint}\n\n"
+        "Отправьте в чат новое название кнопки (обычный текст + обычные эмодзи).\n"
+        "Премиум-эмодзи в кнопках Telegram не поддерживаются — теги будут вырезаны.",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("🔄 Сбросить название по умолчанию", callback_data=f'adm_btnrst_{key}')
+        ], [
+            InlineKeyboardButton("🔙 К списку кнопок", callback_data='adm_buttons_menu')
+        ]]),
+        parse_mode='HTML'
+    )
+
+
+async def admin_button_reset(query, context, key):
+    if query.from_user.id != ADMIN_ID:
+        await query.answer("⛔ Нет прав", show_alert=True)
+        return
+
+    delete_setting('btn_' + key)
+    context.user_data['state'] = ''
+    logger.info("Админ %s сбросил название кнопки '%s' на стандартное", query.from_user.id, key)
+    await query.edit_message_text(
+        f"🔄 Название кнопки «{BUTTON_TITLES[key]}» сброшено на стандартное:\n"
+        f"{BUTTON_DEFAULTS[key]}",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("🔙 К списку кнопок", callback_data='adm_buttons_menu')
+        ]]),
+        parse_mode='HTML'
+    )
+
+
+# === Совместимость: старые кнопки админки ссылаются на редактор welcome ===
+async def admin_edit_text(query, context):
+    await admin_edit_screen(query, context, 'welcome')
 
 
 async def admin_reset_text(query, context):
-    if query.from_user.id != ADMIN_ID:
-        await query.answer("⛔ Нет прав", show_alert=True)
-        return
-
-    delete_setting('custom_welcome_text')
-    context.user_data['state'] = ''
-    logger.info("Админ %s сбросил текст приветствия на стандартный", query.from_user.id)
-    await query.edit_message_text(
-        "🔄 Текст приветствия сброшен на стандартный шаблон.",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data='adm_back')]]),
-        parse_mode='HTML'
-    )
+    await admin_text_reset(query, context, 'welcome')
 
 
 async def admin_pay_links(query, context):
@@ -1153,10 +1433,30 @@ async def back_to_menu(query, context):
     )
 
 
+# === HealthCheck HTTP-сервер (для 24/7 бесплатного облачного хостинга) ===
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Bot is running 24/7 OK")
+
+    def log_message(self, format, *args):
+        pass  # не засоряем лог
+
+
+def start_health_server():
+    port = int(os.getenv("PORT", "8080"))
+    server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
+    logger.info("HealthCheck HTTP-сервер запущен на порту %s (для 24/7 Free Cloud)", port)
+    server.serve_forever()
+
+
 # === Main ===
 def main():
     init_db()
     logger.info("Администратор (ADMIN_ID): %s", ADMIN_ID)
+
+    threading.Thread(target=start_health_server, daemon=True).start()
 
     app = Application.builder().token(TOKEN).build()
 
