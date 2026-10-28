@@ -1,6 +1,7 @@
 import os
 import re
 import html
+import bisect
 import time
 import logging
 import sqlite3
@@ -145,6 +146,83 @@ def screen_text(key: str, **variables) -> str:
     for var, val in variables.items():
         text = text.replace('{' + var + '}', str(val))
     return text
+
+
+# === Сборка HTML из сообщения с Премиум-эмодзи (по entities) ===
+ENTITY_TAGS = {
+    'bold': ('<b>', '</b>'),
+    'italic': ('<i>', '</i>'),
+    'underline': ('<u>', '</u>'),
+    'strikethrough': ('<s>', '</s>'),
+    'spoiler': ('<tg-spoiler>', '</tg-spoiler>'),
+    'code': ('<code>', '</code>'),
+    'pre': ('<pre>', '</pre>'),
+    'blockquote': ('<blockquote>', '</blockquote>'),
+    'expandable_blockquote': ('<blockquote expandable>', '</blockquote>'),
+}
+
+
+def _utf16_offsets(text: str):
+    """Префиксные UTF-16 смещения: Telegram считает offset/length в UTF-16, а Python — в символах.
+    Возвращает список длиной len(text)+1, где [i] — UTF-16 смещение начала символа i."""
+    offsets = [0]
+    pos = 0
+    for ch in text:
+        pos += 2 if ord(ch) > 0xFFFF else 1
+        offsets.append(pos)
+    return offsets
+
+
+def get_message_html_with_custom_emojis(message) -> str:
+    """HTML сообщения, в котором Премиум-эмодзи намертво вшиты тегами
+    <tg-emoji emoji-id="ID">СИМВОЛ</tg-emoji>.
+    Работает по entities/caption_entities и корректно учитывает UTF-16 смещения Telegram,
+    поэтому не зависит от того, как .text_html обработал кастомные эмодзи."""
+    text = message.text or message.caption or ""
+    entities = message.entities or message.caption_entities or []
+    if not text:
+        return ""
+
+    total = len(text)
+    offsets = _utf16_offsets(text)
+
+    opens = {}   # индекс символа -> [(UTF-16 конец, открывающий тег)]
+    closes = {}  # индекс символа -> [(UTF-16 начало, закрывающий тег)]
+
+    for e in entities:
+        start = bisect.bisect_left(offsets, e.offset)
+        end = bisect.bisect_left(offsets, e.offset + e.length)
+        start = max(0, min(start, total))
+        end = max(0, min(end, total))
+        if start >= end:
+            continue
+
+        if e.type == 'custom_emoji':
+            emoji_id = getattr(e, 'custom_emoji_id', None)
+            if not emoji_id:
+                continue
+            pair = (f'<tg-emoji emoji-id="{emoji_id}">', '</tg-emoji>')
+        elif e.type == 'text_link' and getattr(e, 'url', None):
+            pair = (f'<a href="{html.escape(e.url, quote=True)}">', '</a>')
+        elif e.type in ENTITY_TAGS:
+            pair = ENTITY_TAGS[e.type]
+        else:
+            continue  # mention/hashtag/url/cashtag и т.п. тегов не требуют
+
+        opens.setdefault(start, []).append((e.offset + e.length, pair[0]))
+        closes.setdefault(end, []).append((e.offset, pair[1]))
+
+    parts = []
+    for i in range(total + 1):
+        # Закрываем сущности: сначала внутренние (начались позже)
+        for _, tag in sorted(closes.get(i, []), key=lambda x: -x[0]):
+            parts.append(tag)
+        # Открываем сущности: сначала внешние (заканчиваются позже)
+        for _, tag in sorted(opens.get(i, []), key=lambda x: -x[0]):
+            parts.append(tag)
+        if i < total:
+            parts.append(html.escape(text[i]))
+    return ''.join(parts)
 
 
 # === Редактируемые названия кнопок (ШАГ 2) ===
@@ -514,8 +592,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if key not in TEXT_DEFAULTS:
             context.user_data['state'] = ''
             return
-        # text_html сохраняет жирный/курсив/ссылки и теги <tg-emoji>
-        text_html = update.message.text_html
+        # Собираем HTML вручную по entities: .text_html не гарантирует <tg-emoji>
+        # для Премиум-эмодзи, присланных в диалоге с ботом
+        text_html = get_message_html_with_custom_emojis(update.message) or update.message.text_html
         if not text_html:
             await update.message.reply_text("❌ Отправьте текстовое сообщение.")
             return
@@ -524,9 +603,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.info("Админ %s обновил текст экрана '%s' (%s символов)", user.id, key, len(text_html))
         await update.message.reply_text(
             f"✅ <b>Текст экрана «{SCREEN_TITLES[key]}» обновлён!</b>\n\n"
-            "Проверьте соответствующий раздел бота. Изменения применяются сразу.",
+            "Проверьте соответствующий раздел бота. Изменения применяются сразу.\n"
+            "Ниже — как текст выглядит для покупателей:",
             parse_mode='HTML'
         )
+        try:
+            await update.message.reply_text(text_html, parse_mode='HTML')
+        except Exception as exc:
+            logger.warning("Не удалось показать предпросмотр текста '%s': %s", key, exc)
 
     elif state == 'WAIT_BUTTON_TEXT':
         if user.id != ADMIN_ID:
