@@ -754,6 +754,61 @@ def _load_settings_backup() -> dict:
         return {}
 
 
+# Кэш пользователей для рассылки (user_id -> username)
+_USERS_CACHE = {}
+
+
+def register_user(user) -> None:
+    """Сохраняет пользователя в таблицу users (база рассылки) и в кэш."""
+    if user is None or getattr(user, 'is_bot', False):
+        return
+    uid = getattr(user, 'id', None)
+    if not uid:
+        return
+    uname = getattr(user, 'username', None) or ''
+    _USERS_CACHE[int(uid)] = uname
+    try:
+        conn = connect_db()
+        c = conn.cursor()
+        c.execute(
+            "INSERT INTO users (user_id, username, updated_at) VALUES (?, ?, ?) "
+            "ON CONFLICT(user_id) DO UPDATE SET username = excluded.username, "
+            "updated_at = excluded.updated_at",
+            (uid, uname, time.time()))
+        conn.commit()
+        conn.close()
+    except Exception as exc:
+        logger.warning("Не удалось зарегистрировать пользователя %s: %s", uid, exc)
+
+
+def count_users() -> int:
+    """Количество пользователей в базе рассылки."""
+    try:
+        conn = connect_db()
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM users")
+        row = c.fetchone()
+        conn.close()
+        return int(row[0]) if row else len(_USERS_CACHE)
+    except Exception:
+        return len(_USERS_CACHE)
+
+
+def get_all_user_ids():
+    """Все user_id из базы рассылки (fallback на кэш)."""
+    try:
+        conn = connect_db()
+        c = conn.cursor()
+        c.execute("SELECT user_id FROM users")
+        ids = [int(r[0]) for r in c.fetchall()]
+        conn.close()
+        if ids:
+            return ids
+    except Exception as exc:
+        logger.warning("Не удалось прочитать users: %s", exc)
+    return list(_USERS_CACHE.keys())
+
+
 def init_db():
     try:
         conn = connect_db()
@@ -771,7 +826,28 @@ def init_db():
             logger.info("Добавлена колонка orders.buyer_id")
         except Exception:
             conn.rollback()  # колонка уже существует (SQLite/PostgreSQL)
+        c.execute('''CREATE TABLE IF NOT EXISTS users (
+            user_id BIGINT PRIMARY KEY, username TEXT, updated_at REAL)''')
         conn.commit()
+
+        # Перенос всех покупателей из orders в users (база рассылки)
+        try:
+            c.execute("SELECT DISTINCT buyer_id, buyer FROM orders WHERE buyer_id IS NOT NULL")
+            migrated = 0
+            import time as _time
+            for uid, uname in c.fetchall():
+                c.execute(
+                    "INSERT INTO users (user_id, username, updated_at) VALUES (?, ?, ?) "
+                    "ON CONFLICT(user_id) DO UPDATE SET username = excluded.username",
+                    (uid, uname, _time.time()))
+                _USERS_CACHE[int(uid)] = uname
+                migrated += 1
+            if migrated:
+                conn.commit()
+                logger.info("Покупатели перенесены в users для рассылки: %s", migrated)
+        except Exception as exc:
+            conn.rollback()
+            logger.warning("Перенос покупателей в users не удался: %s", exc)
 
         # Восстановление настроек из JSON, если БД пустая/стёрлась
         backup = _load_settings_backup()
@@ -860,6 +936,7 @@ def buyer_name(user) -> str:
 # === Меню ===
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
+    register_user(user)
     logger.info("Команда /start от пользователя id=%s (@%s)", user.id, user.username)
     context.user_data.clear()
 
@@ -882,6 +959,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user = update.effective_user
+    register_user(user)
 
     if is_rate_limited(context, user.id):
         return
@@ -920,6 +998,10 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         'adm_texts_menu': admin_texts_menu,
         'adm_buttons_menu': admin_buttons_menu,
         'adm_pay_links': admin_pay_links,
+        'adm_broadcast': admin_broadcast,
+        'adm_fee_0': lambda q, c: admin_set_fee(q, c, 0),
+        'adm_fee_3': lambda q, c: admin_set_fee(q, c, 3),
+        'adm_fee_5': lambda q, c: admin_set_fee(q, c, 5),
         'adm_fragment': admin_fragment,
         'adm_cloud': admin_cloud,
         'adm_set_db_url': admin_set_db_url,
@@ -1019,6 +1101,12 @@ async def use_my_username(query, context, for_premium: bool):
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state = context.user_data.get('state', '')
     user = update.effective_user
+    register_user(user)
+
+    # Рассылка: админ отправил текст всем пользователям
+    if state == 'WAIT_BROADCAST' and user.id == ADMIN_ID:
+        await broadcast_admin_message(update, context, copy=False)
+        return
 
     # Премиум-эмодзи от владельца: сначала проверяем режим установки, потом эхо
     if (user.id == ADMIN_ID and update.message.entities
@@ -1559,10 +1647,127 @@ def get_payment_url(setting_key: str, env_default: str) -> str:
     return get_setting(setting_key) or env_default
 
 
+def is_placeholder_url(url: str) -> bool:
+    """True, если ссылка ещё не задана владельцем (заглушка из дефолтов)."""
+    return 'placeholder' in (url or '').lower()
+
+
+def get_fee_percent() -> int:
+    """Компенсация комиссии шлюза: 0 / 3 / 5 (%). Добавляется к сумме на странице /pay."""
+    try:
+        return max(0, min(15, int(float(get_setting('payment_fee_percent') or 0))))
+    except (TypeError, ValueError):
+        return 0
+
+
+def total_with_fee(total) -> float:
+    return round(float(total) * (1 + get_fee_percent() / 100.0), 2)
+
+
+def pay_page_url(order_id, total, method, recipient='', item='') -> str:
+    """Ссылка на нашу встроенную страницу оплаты /pay (0% комиссии для владельца)."""
+    base = self_ping_target().rstrip('/')
+    params = urlencode({
+        'order_id': order_id,
+        'amount': _fmt_total(total),
+        'method': method,
+        'recipient': recipient or '',
+        'item': item or '',
+    })
+    return f"{base}/pay?{params}"
+
+
+def render_pay_page(order_id, amount, method, recipient='', item='') -> bytes:
+    """HTML встроенной страницы оплаты (тёмный стиль Telegram, адаптивная)."""
+    method_names = {'sbp': 'СБП (Система Быстрых Платежей)',
+                    'card': 'Банковская карта (РФ)',
+                    'crypto': 'Криптовалюта (TON / USDT)'}
+    pay_type = method if method in method_names else 'sbp'
+    method_title = method_names[pay_type]
+
+    fee = get_fee_percent()
+    base_amount = float(amount) if amount else 0.0
+    final_amount = round(base_amount * (1 + fee / 100.0), 2)
+    amount_str = f"{final_amount:g}"
+    fee_note = (f"<div class='fee'>✅ Комиссия магазина: <b>0%</b>"
+                + (f" <span class='muted'>(компенсация комиссии шлюза {fee}% уже учтена)</span>" if fee else "")
+                + "</div>")
+
+    # Шлюз владельца (если задан реальный — не заглушка)
+    gateway_key, env_default = {
+        'sbp': ('sbp_url', SBP_PAYMENT_URL),
+        'card': ('card_url', CARD_PAYMENT_URL),
+        'crypto': ('crypto_url', CRYPTO_PAYMENT_URL),
+    }[pay_type]
+    gateway = get_payment_url(gateway_key, env_default)
+    if gateway and not is_placeholder_url(gateway):
+        gateway_url = build_payment_url(
+            gateway, order_id, final_amount,
+            comment=f"order_{order_id}" if pay_type != 'crypto' else f"Order #{order_id}")
+        pay_button = (f"<a class='btn' href='{html.escape(gateway_url, quote=True)}'>"
+                      f"💳 Перейти к оплате {amount_str} ₽</a>")
+    else:
+        pay_button = ("<p class='muted'>Оплата пока настраивается владельцем магазина — "
+                      "напишите в поддержку, и заказ оформят вручную.</p>")
+
+    details = (get_setting('pay_page_details') or '').strip()
+    details_html = (f"<div class='details'>{html.escape(details)}</div>" if details else "")
+
+    recipient_html = (f"<div class='row'>👤 Получатель: <b>{html.escape(recipient)}</b></div>"
+                      if recipient else "")
+    item_html = (f"<div class='row'>📦 Товар: {html.escape(item)}</div>" if item else "")
+    bot_url = self_ping_target().rstrip('/')
+
+    page = f"""<!DOCTYPE html>
+<html lang="ru"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Оплата заказа #{html.escape(str(order_id))}</title>
+<style>
+  body {{ font-family: -apple-system, 'Segoe UI', Roboto, sans-serif; background:#0e1621;
+         color:#e7edf3; margin:0; padding:20px; }}
+  .card {{ max-width:420px; margin:24px auto; background:#17212b; border-radius:16px;
+          padding:24px; box-shadow:0 8px 30px rgba(0,0,0,.4); }}
+  h1 {{ font-size:19px; margin:0 0 18px; color:#2ea6ff; }}
+  .row {{ margin:8px 0; font-size:15px; word-break:break-word; }}
+  .amount {{ font-size:42px; font-weight:700; margin:18px 0 4px; color:#fff; }}
+  .fee {{ margin:6px 0 18px; font-size:14px; color:#4fce5d; }}
+  .muted {{ color:#8fa3b3; font-size:13px; }}
+  .details {{ background:#0e1621; border-radius:10px; padding:12px; margin:14px 0;
+             font-size:14px; white-space:pre-wrap; }}
+  .btn {{ display:block; text-align:center; background:#4fce5d; color:#0e1621;
+         font-weight:700; font-size:17px; padding:14px; border-radius:12px;
+         text-decoration:none; margin:12px 0; }}
+  .btn.blue {{ background:#2ea6ff; color:#fff; }}
+  .btn.ghost {{ background:#22303c; color:#e7edf3; font-weight:500; font-size:15px; }}
+</style></head><body>
+<div class="card">
+  <h1>🔒 Защищённая страница оплаты</h1>
+  <div class="row">🧾 Заказ: <b>#{html.escape(str(order_id))}</b></div>
+  {item_html}
+  {recipient_html}
+  <div class="row">🛍 Способ оплаты: {html.escape(method_title)}</div>
+  <div class="amount">{amount_str} ₽</div>
+  {fee_note}
+  {pay_button}
+  {details_html}
+  <a class="btn ghost" href="https://t.me/starsdefoltsupport">💬 Написать в техподдержку (@starsdefoltsupport)</a>
+  <a class="btn blue" href="{html.escape(bot_url, quote=True)}">✅ Вернуться в бот и нажать «Я оплатил»</a>
+</div>
+</body></html>"""
+    return page.encode('utf-8')
+
+
 async def payment_sbp(query, context):
     total = context.user_data.get('total', 0)
     order_id = context.user_data.get('order_id', 0)
-    url = build_payment_url(get_payment_url('sbp_url', SBP_PAYMENT_URL), order_id, total)
+    base = get_payment_url('sbp_url', SBP_PAYMENT_URL)
+    if is_placeholder_url(base):
+        url = pay_page_url(order_id, total, 'sbp',
+                           context.user_data.get('recipient', ''),
+                           context.user_data.get('item_title', ''))
+    else:
+        url = build_payment_url(base, order_id, total)
     logger.info("Оплата СБП: заказ=%s, сумма=%s₽, ссылка=%s", order_id, total, url)
 
     keyboard = [
@@ -1579,7 +1784,13 @@ async def payment_sbp(query, context):
 async def payment_card(query, context):
     total = context.user_data.get('total', 0)
     order_id = context.user_data.get('order_id', 0)
-    url = build_payment_url(get_payment_url('card_url', CARD_PAYMENT_URL), order_id, total)
+    base = get_payment_url('card_url', CARD_PAYMENT_URL)
+    if is_placeholder_url(base):
+        url = pay_page_url(order_id, total, 'card',
+                           context.user_data.get('recipient', ''),
+                           context.user_data.get('item_title', ''))
+    else:
+        url = build_payment_url(base, order_id, total)
     logger.info("Оплата картой РФ: заказ=%s, сумма=%s₽, ссылка=%s", order_id, total, url)
 
     keyboard = [
@@ -1597,7 +1808,12 @@ async def payment_crypto(query, context):
     total = context.user_data.get('total', 0)
     order_id = context.user_data.get('order_id', 0)
     base = get_payment_url('crypto_url', CRYPTO_PAYMENT_URL)
-    url = build_payment_url(base, order_id, total, comment=f"Order #{order_id}")
+    if is_placeholder_url(base):
+        url = pay_page_url(order_id, total, 'crypto',
+                           context.user_data.get('recipient', ''),
+                           context.user_data.get('item_title', ''))
+    else:
+        url = build_payment_url(base, order_id, total, comment=f"Order #{order_id}")
     logger.info("Оплата криптовалютой: заказ=%s, сумма=%s₽, ссылка=%s", order_id, total, url)
     label = "💎 Оплатить в Tonkeeper" if (is_ton_address(base.strip()) or 'tonkeeper' in base.lower()) \
         else f"💳 Перейти на страницу оплаты ({total:g}₽)"
@@ -1639,6 +1855,79 @@ async def remove_sticker(update: Update, context: ContextTypes.DEFAULT_TYPE):
     delete_setting('welcome_sticker')
     logger.info("Админ %s удалил приветственный стикер", user.id)
     await update.message.reply_text("🗑 Приветственный стикер удалён.")
+
+
+# === Админ: массовая рассылка всем пользователям ===
+async def admin_broadcast(query, context):
+    if query.from_user.id != ADMIN_ID:
+        await query.answer("⛔ Нет прав", show_alert=True)
+        return
+
+    total = count_users()
+    context.user_data['state'] = 'WAIT_BROADCAST'
+    logger.info("Админ %s начал рассылку (получателей: %s)", query.from_user.id, total)
+
+    await query.edit_message_text(
+        f"📢 <b>Рассылка уведомлений всем пользователям</b>\n\n"
+        f"👥 Всего получателей: <b>{total}</b>\n\n"
+        "Просто отправьте в чат любое сообщение (текст с Премиум-эмодзи, картинку, "
+        "видео или стикер) — бот сразу разошлёт его всем пользователям!",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("🔙 Назад", callback_data='adm_back')
+        ]]),
+        parse_mode='HTML'
+    )
+
+
+async def broadcast_admin_message(update: Update, context: ContextTypes.DEFAULT_TYPE, copy: bool):
+    """Рассылка сообщения админа всем пользователям (текст — HTML, медиа — copy_message)."""
+    message = update.message
+    ids = get_all_user_ids()
+    sent, blocked = 0, 0
+    status = await message.reply_text(f"📢 Начинаю рассылку на {len(ids)} получателей…")
+
+    for uid in ids:
+        if uid == ADMIN_ID:
+            continue
+        try:
+            if copy:
+                await context.bot.copy_message(
+                    chat_id=uid, from_chat_id=message.chat_id, message_id=message.message_id)
+            else:
+                await context.bot.send_message(
+                    chat_id=uid,
+                    text=get_message_html_with_custom_emojis(message),
+                    parse_mode='HTML')
+            sent += 1
+        except Exception as exc:
+            logger.info("Рассылка: пользователь %s недоступен (%s)", uid, exc)
+            blocked += 1
+        await asyncio.sleep(0.05)  # лимиты Telegram
+
+    context.user_data['state'] = ''
+    logger.info("Рассылка завершена: доставлено=%s, недоступно=%s", sent, blocked)
+    try:
+        await status.edit_text(
+            f"✅ <b>Рассылка завершена!</b>\n\n"
+            f"📬 Доставлено: <b>{sent}</b>\n"
+            f"🚫 Заблокировали бота / недоступны: <b>{blocked}</b>",
+            parse_mode='HTML')
+    except Exception:
+        await message.reply_text(
+            f"✅ Рассылка завершена: доставлено {sent}, недоступно {blocked}.")
+
+
+async def handle_broadcast_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Медиа (фото/видео/стикер/голосовое) от админа в режиме рассылки — copy_message всем."""
+    user = update.effective_user
+    if user.id != ADMIN_ID:
+        return
+    if context.user_data.get('state') == 'WAIT_BROADCAST':
+        await broadcast_admin_message(update, context, copy=True)
+        return
+    # вне рассылки — обычное поведение (например, установка welcome-стикера)
+    if update.message.sticker:
+        await handle_sticker(update, context)
 
 
 # === Заказы: хелперы ===
@@ -2183,6 +2472,7 @@ def admin_menu_keyboard():
         [InlineKeyboardButton("📝 Редактор текстов (Все экраны)", callback_data='adm_texts_menu')],
         [InlineKeyboardButton("🔘 Изменить названия кнопок (Блоков)", callback_data='adm_buttons_menu')],
         [InlineKeyboardButton("💳 Настроить ссылки оплаты", callback_data='adm_pay_links')],
+        [InlineKeyboardButton("📢 Рассылка пользователям", callback_data='adm_broadcast')],
         [InlineKeyboardButton("🤖 Автовыдача Fragment", callback_data='adm_fragment')],
         [InlineKeyboardButton("☁️ Облако и База данных", callback_data='adm_cloud')],
         [InlineKeyboardButton("✨ Премиум-эмодзи в меню", callback_data='adm_emoji')]
@@ -2553,21 +2843,37 @@ async def admin_pay_links(query, context):
     sbp = get_payment_url('sbp_url', SBP_PAYMENT_URL)
     card = get_payment_url('card_url', CARD_PAYMENT_URL)
     crypto = get_payment_url('crypto_url', CRYPTO_PAYMENT_URL)
+    fee = get_fee_percent()
+    fee_emoji = {0: '✅', 3: '➕', 5: '➕'}.get(fee, '➕')
 
     await query.edit_message_text(
         "💳 <b>Настройка ссылок оплаты</b>\n\n"
         f"💸 СБП: <code>{html.escape(sbp)}</code>\n"
         f"💳 Карта РФ: <code>{html.escape(card)}</code>\n"
         f"💎 Крипта: <code>{html.escape(crypto)}</code>\n\n"
+        f"💱 Компенсация комиссии шлюза: <b>{fee}%</b>\n\n"
         "Нажмите нужную кнопку — и отправьте новую ссылку сообщением (без цифр и кодов).",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("💸 Изменить ссылку СБП", callback_data='adm_setpay_sbp')],
             [InlineKeyboardButton("💳 Изменить ссылку Карты РФ", callback_data='adm_setpay_card')],
             [InlineKeyboardButton("💎 Изменить ссылку Крипты", callback_data='adm_setpay_crypto')],
+            [InlineKeyboardButton(f"{fee_emoji} Комиссия: 0%", callback_data='adm_fee_0'),
+             InlineKeyboardButton("3%", callback_data='adm_fee_3'),
+             InlineKeyboardButton("5%", callback_data='adm_fee_5')],
             [InlineKeyboardButton("🔙 Назад", callback_data='adm_back')],
         ]),
         parse_mode='HTML'
     )
+
+
+async def admin_set_fee(query, context, percent):
+    if query.from_user.id != ADMIN_ID:
+        await query.answer("⛔ Нет прав", show_alert=True)
+        return
+    set_setting('payment_fee_percent', str(percent))
+    logger.info("Админ %s установил компенсацию комиссии %s%%", query.from_user.id, percent)
+    await query.answer(f"✅ Комиссия шлюза: {percent}% — сумма на странице оплаты пересчитана.")
+    await admin_pay_links(query, context)
 
 
 async def admin_setpay(query, context, pay_type):
@@ -2897,11 +3203,33 @@ async def back_to_menu(query, context):
 
 
 # === HealthCheck HTTP-сервер (для 24/7 бесплатного облачного хостинга) ===
-BOT_VERSION = "2026-10-28.7"
+BOT_VERSION = "2026-10-28.8"
 
 
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
+        if self.path.startswith('/pay'):
+            try:
+                from urllib.parse import urlparse, parse_qs
+                qs = parse_qs(urlparse(self.path).query)
+                param = lambda k: (qs.get(k, [''])[0] or '').strip()
+                page = render_pay_page(
+                    order_id=param('order_id') or '—',
+                    amount=param('amount') or '0',
+                    method=param('method') or 'sbp',
+                    recipient=param('recipient'),
+                    item=param('item'))
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.end_headers()
+                self.wfile.write(page)
+            except Exception as exc:
+                logger.error("Страница /pay: %s", exc)
+                self.send_response(500)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.end_headers()
+                self.wfile.write("Ошибка страницы оплаты".encode())
+            return
         self.send_response(200)
         self.send_header("Content-Type", "text/plain; charset=utf-8")
         self.end_headers()
@@ -2946,7 +3274,11 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("admin", admin_panel))
     app.add_handler(CommandHandler("remove_sticker", remove_sticker))
-    app.add_handler(MessageHandler(filters.Sticker.ALL, handle_sticker))
+    app.add_handler(MessageHandler(filters.Sticker.ALL, handle_broadcast_media))
+    app.add_handler(MessageHandler(
+        filters.PHOTO | filters.VIDEO | filters.VOICE | filters.ANIMATION
+        | filters.AUDIO | filters.VIDEO_NOTE | filters.Document.ALL,
+        handle_broadcast_media))
     app.add_handler(CallbackQueryHandler(button))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
