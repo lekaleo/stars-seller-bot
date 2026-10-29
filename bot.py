@@ -10,6 +10,7 @@ import sqlite3
 
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import threading
+from urllib.parse import quote, urlencode
 
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -72,7 +73,75 @@ RATE_LIMIT_SECONDS = 1.0  # анти-флуд: не чаще одного дей
 
 REVIEWS_LINK = "https://t.me/starsdefolt"
 
-USERNAME_RE = re.compile(r"^@[a-zA-Z0-9_]{5,32}$")
+USERNAME_RE = re.compile(r"^@[a-zA-Z][a-zA-Z0-9_]{4,31}$")
+
+# Заглушки-примеры, которые нельзя принимать за настоящий ник
+FORBIDDEN_USERNAMES = {
+    '@username', '@user', '@admin', '@telegram', '@support', '@test', '@bot',
+    '@starsdefolt', '@durov',
+}
+
+# Юзернейм самого бота (заполняется через get_me() при старте)
+BOT_USERNAME = (os.getenv('BOT_USERNAME') or '').strip()
+
+
+def normalize_username(raw: str) -> str:
+    value = (raw or '').strip()
+    if value and not value.startswith('@'):
+        value = '@' + value
+    return value
+
+
+def validate_username(raw: str):
+    """Проверка @username по правилам Telegram. Возвращает (username | None, текст ошибки | None)."""
+    username = normalize_username(raw)
+    low = username.lower()
+
+    if low in FORBIDDEN_USERNAMES:
+        return None, ("❌ Вы ввели слово-пример «@username» вместо настоящего ника! "
+                      "Укажите реальный @никнейм аккаунта Telegram, куда нужно начислить покупку.")
+    if BOT_USERNAME and low == '@' + BOT_USERNAME.lstrip('@').lower():
+        return None, ("❌ Это юзернейм самого бота — укажите @никнейм аккаунта, "
+                      "куда нужно начислить покупку.")
+    if username.endswith('_') or '__' in username:
+        return None, ("❌ Юзернейм не может заканчиваться на «_» или содержать два «_» подряд.\n"
+                      "Введите настоящий @никнейм аккаунта Telegram.")
+    if not USERNAME_RE.match(username):
+        return None, ("❌ Некорректный формат! Введите настоящий @username Telegram\n"
+                      "(начинается с латинской буквы, 5–32 символа: латинские буквы, цифры и _).")
+    return username, None
+
+
+def verify_telegram_username(username: str) -> bool:
+    """Проверяет, что аккаунт существует: у реальной страницы t.me есть og:title/tgme_page_title.
+
+    При сетевой ошибке возвращает True (не блокируем продажу из-за нашего таймаута),
+    при 404 — False (аккаунта нет).
+    """
+    import urllib.error as _urlerr
+    import urllib.request as _urlreq
+
+    name = (username or '').lstrip('@').strip()
+    if not name:
+        return False
+    url = f"https://t.me/{name}"
+    request = _urlreq.Request(url, headers={'User-Agent': 'Mozilla/5.0 (compatible; StarsBot/1.0)'})
+    try:
+        with _urlreq.urlopen(request, timeout=10) as response:
+            page = response.read(60000).decode('utf-8', errors='replace')
+        if 'tgme_page_title' in page or 'property="og:title"' in page or "property='og:title'" in page:
+            return True
+        logger.warning("Проверка @%s: страница без og:title — аккаунт не найден", name)
+        return False
+    except _urlerr.HTTPError as exc:
+        if exc.code == 404:
+            logger.warning("Проверка @%s: 404 — аккаунта нет", name)
+            return False
+        logger.warning("Проверка @%s: HTTP %s — считаем аккаунт существующим", name, exc.code)
+        return True
+    except Exception as exc:
+        logger.warning("Проверка @%s не удалась (%s) — не блокируем заказ", name, exc)
+        return True
 
 # === Редактируемые тексты всех экранов (стандартные = утверждённые владельцем 28.10.2026) ===
 TEXT_DEFAULTS = {
@@ -258,9 +327,9 @@ BUTTON_DEFAULTS = {
     'btn_main_stars': "Звёзды",
     'btn_main_premium': "Telegram Premium",
     'btn_main_reviews': "Отзывы",
-    'btn_stars_100': "🌟 100 звёзд ({price}₽)",
-    'btn_stars_1000': "🌟 1000 звёзд ({price}₽)",
-    'btn_stars_10000': "🌟 10000 звёзд ({price}₽)",
+    'btn_stars_100': "🌟 100 звёзд",
+    'btn_stars_1000': "🌟 1000 звёзд",
+    'btn_stars_10000': "🌟 10000 звёзд",
     'btn_prem_3': "💎 3 месяца — 1390₽",
     'btn_prem_6': "💎 6 месяцев — 1850₽",
     'btn_prem_12': "🔥 12 месяцев — 3190₽ (Выгодно)",
@@ -281,9 +350,9 @@ BUTTON_TITLES = {
     'btn_main_stars': '1-й блок главного меню',
     'btn_main_premium': '2-й блок главного меню',
     'btn_main_reviews': '3-й блок главного меню',
-    'btn_stars_100': 'Пакет 100 звёзд ({price} = курс × 100)',
-    'btn_stars_1000': 'Пакет 1000 звёзд',
-    'btn_stars_10000': 'Пакет 10000 звёзд',
+    'btn_stars_100': 'Пакет 100 звёзд (цена считается сама)',
+    'btn_stars_1000': 'Пакет 1000 звёзд (цена считается сама)',
+    'btn_stars_10000': 'Пакет 10000 звёзд (цена считается сама)',
     'btn_prem_3': 'Premium 3 месяца',
     'btn_prem_6': 'Premium 6 месяцев',
     'btn_prem_12': 'Premium 12 месяцев',
@@ -294,18 +363,43 @@ BUTTON_TITLES = {
 }
 
 BUTTON_VARS = {
-    'btn_stars_100': '{price}', 'btn_stars_1000': '{price}', 'btn_stars_10000': '{price}',
+    'btn_stars_100': 'цену писать не нужно — считается сама по курсу',
+    'btn_stars_1000': 'цену писать не нужно — считается сама по курсу',
+    'btn_stars_10000': 'цену писать не нужно — считается сама по курсу',
 }
+
+# Количество звёзд в пакетах — цена на кнопке считается автоматически
+STAR_PACK_COUNTS = {
+    'btn_stars_100': 100,
+    'btn_stars_1000': 1000,
+    'btn_stars_10000': 10000,
+}
+
+
+def _star_pack_price(key: str) -> str:
+    count = STAR_PACK_COUNTS[key]
+    return f"{round(count * get_rate(), 2):g}"
 
 
 def btn_label(key: str, **variables) -> str:
     """Название кнопки: settings['btn_<key>'] -> BUTTON_DEFAULTS.
-    Очищается от любых HTML-тегов (в т.ч. <tg-emoji>) и HTML-сущностей — в кнопках они недопустимы."""
+    Для пакетов звёзд цена ВСЕГДА считается сама по курсу — владельцу не нужно
+    писать {price} или формулы: бот сам подставит сумму и допишет «(140₽)»."""
     label = get_setting('btn_' + key) or BUTTON_DEFAULTS[key]
     label = re.sub(r'<[^>]+>', '', label)
     label = html.unescape(label).strip()
     for var, val in variables.items():
         label = label.replace('{' + var + '}', str(val))
+
+    if key in STAR_PACK_COUNTS:
+        calc_price = _star_pack_price(key)
+        # убираем любые варианты формулы «курс × 100 / курс * звёзды» и плейсхолдер {price}
+        label = re.sub(r'курс\s*[×x*]\s*(?:звёзды|звезды|\d+)', calc_price, label, flags=re.I)
+        label = label.replace('{price}', calc_price)
+        # убираем старую цену в скобках, чтобы она не устарела при смене курса
+        label = re.sub(r'\s*\(\s*[\d.,]+\s*₽\s*\)', '', label)
+        label = re.sub(r'\s+', ' ', label).strip()
+        label = f"{label} ({calc_price}₽)"
     return label
 
 
@@ -388,12 +482,56 @@ def main_keyboard():
     ]
 
 
-def build_payment_url(base_url: str, order_id, total) -> str:
-    """Персональная ссылка на страницу оплаты с ID заказа и суммой."""
+def _fmt_total(total) -> str:
+    """Сумма без хвостовых нулей: 140.0 -> '140', 140.5 -> '140.5'."""
+    try:
+        return f"{float(total):g}"
+    except (TypeError, ValueError):
+        return str(total)
+
+
+def is_ton_address(value: str) -> bool:
+    value = (value or '').strip()
+    return bool(re.fullmatch(r'(?:UQ|EQ)[A-Za-z0-9_\-]{46}', value))
+
+
+def build_payment_url(base_url: str, order_id, total, comment: str = None) -> str:
+    """Персональная ссылка на оплату с предзаполненной суммой (ЮMoney и кассы).
+
+    - ЮMoney (yoomoney.ru/to/…) → ?sum=<сумма>&label=order_<id> (+ quickpay-форма)
+    - касса (Platega/Lava/AAIO/CloudTips) → ?order_id=<id>&amount=<сумма>
+    - TON-адрес или tonkeeper → ссылка Tonkeeper с комментарием Order #id
+    """
     if not base_url:
         return "https://t.me/starsdefolt"
+
+    amount = _fmt_total(total)
+    comment = comment or f"order_{order_id}"
+    low = base_url.strip().lower()
+
+    # Прямая крипто-оплата: адрес TON-кошелька или ссылка tonkeeper
+    if is_ton_address(base_url.strip()):
+        return f"https://app.tonkeeper.com/transfer/{base_url.strip()}?text={quote(comment)}"
+    if 'tonkeeper' in low or low.startswith('ton://'):
+        separator = "&" if "?" in base_url else "?"
+        return f"{base_url}{separator}text={quote(comment)}"
+
+    # ЮMoney: личная страница перевода или быстрая форма
+    if 'yoomoney.ru' in low or 'money.yandex' in low:
+        if 'quickpay' in low:
+            separator = "&" if "?" in base_url else "?"
+            return f"{base_url}{separator}sum={amount}&label={quote(comment)}"
+        if '/to/' in low:
+            return f"https://yoomoney.ru/quickpay/confirm.xml?receiver={quote(base_url)}&sum={amount}&label={quote(comment)}&quickpay-form=button"
+        separator = "&" if "?" in base_url else "?"
+        return f"{base_url}{separator}sum={amount}&label={quote(comment)}"
+
+    # Обычные кассы и всё остальное: order_id + amount (+ comment)
     separator = "&" if "?" in base_url else "?"
-    return f"{base_url}{separator}order_id={order_id}&amount={total}"
+    url = f"{base_url}{separator}order_id={order_id}&amount={amount}"
+    if comment:
+        url += f"&comment={quote(comment)}"
+    return url
 
 
 def is_rate_limited(context, user_id) -> bool:
@@ -633,7 +771,7 @@ def init_db():
                 try:
                     c.execute(
                         "INSERT INTO settings (key, value) VALUES (?, ?) "
-                        "ON CONFLICT(key) DO UPDATE SET value = excluded.value", (k, v))
+                        "ON CONFLICT(\"key\") DO UPDATE SET value = excluded.value", (k, v))
                     restored += 1
                 except Exception:
                     conn.rollback()
@@ -658,7 +796,7 @@ def set_setting(key, value):
         c = conn.cursor()
         c.execute(
             "INSERT INTO settings (key, value) VALUES (?, ?) "
-            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            "ON CONFLICT(\"key\") DO UPDATE SET value = excluded.value",
             (key, value)
         )
         conn.commit()
@@ -760,6 +898,8 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         'adm_orders': admin_orders,
         'adm_pending': admin_pending,
         'adm_stats': admin_stats,
+        'use_my_username_stars': lambda q, c: use_my_username(q, c, False),
+        'use_my_username_prem': lambda q, c: use_my_username(q, c, True),
         'adm_rate': admin_rate,
         'adm_emoji': admin_emoji,
         'adm_emoji_clear': admin_emoji_clear,
@@ -836,14 +976,32 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # === Блок 1: Звёзды ===
 async def show_catalog_prompt(query, context):
     context.user_data['state'] = 'WAIT_USERNAME'
-    keyboard = [
-        [InlineKeyboardButton("🔙 Назад", callback_data='back')]
-    ]
+    keyboard = []
+    own_username = getattr(query.from_user, 'username', None) if getattr(query, 'from_user', None) else None
+    if own_username:
+        keyboard.append([InlineKeyboardButton(
+            f"👤 Купить себе (@{own_username})", callback_data='use_my_username_stars')])
+    keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data='back')])
     await query.message.edit_text(
         screen_text('stars_prompt'),
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode='HTML'
     )
+
+
+async def use_my_username(query, context, for_premium: bool):
+    """Быстрый выбор своего аккаунта: покупателю не нужно печатать ник."""
+    username = getattr(query.from_user, 'username', None)
+    if not username:
+        await query.answer("У вашего аккаунта нет @username — введите ник вручную.",
+                           show_alert=True)
+        return
+    context.user_data['recipient'] = '@' + username
+    logger.info("Покупатель id=%s выбрал свой аккаунт @%s", query.from_user.id, username)
+    if for_premium:
+        await show_premium_tariffs(query, context)
+    else:
+        await show_star_options(query, context)
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -890,15 +1048,21 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info("Текстовое сообщение от id=%s в состоянии '%s': %s", user.id, state, text_in)
 
     if state in ('WAIT_USERNAME', 'WAIT_USERNAME_PREMIUM'):
-        username = text_in if text_in.startswith('@') else '@' + text_in
-        if not USERNAME_RE.match(username):
-            logger.warning("Некорректный username от id=%s: %s", user.id, text_in)
+        username, error = validate_username(text_in)
+        if error:
+            logger.warning("Некорректный username от id=%s: %r", user.id, text_in)
             keyboard = [[InlineKeyboardButton("🔙 Назад", callback_data='back')]]
             await update.message.reply_text(
-                "❌ Некорректный формат! Введите настоящий @username Telegram "
-                "(только латинские буквы, цифры и _, от 5 до 32 символов).",
-                reply_markup=InlineKeyboardMarkup(keyboard)
-            )
+                error, reply_markup=InlineKeyboardMarkup(keyboard))
+            return
+        exists = await asyncio.to_thread(verify_telegram_username, username)
+        if not exists:
+            logger.warning("Аккаунт %s не найден в Telegram (id=%s)", username, user.id)
+            keyboard = [[InlineKeyboardButton("🔙 Назад", callback_data='back')]]
+            await update.message.reply_text(
+                f"❌ Аккаунт <code>{html.escape(username)}</code> не найден в Telegram.\n"
+                "Проверьте ник и отправьте его ещё раз:",
+                reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
             return
         context.user_data['recipient'] = username
         logger.info("Установлен получатель: %s", username)
@@ -1019,9 +1183,16 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ Не выбран способ оплаты — откройте /admin.")
             return
         link = text_in.strip()
-        if not link.startswith('http'):
-            await update.message.reply_text(
-                "❌ Ссылка должна начинаться с https://\nПопробуйте ещё раз:")
+        if pay_type == 'crypto' and is_ton_address(link):
+            pass  # прямой адрес TON-кошелька разрешён
+        elif not link.startswith('http'):
+            if pay_type == 'crypto':
+                await update.message.reply_text(
+                    "❌ Отправьте ссылку (https://…) или адрес TON-кошелька (UQ… / EQ…).\n"
+                    "Попробуйте ещё раз:")
+            else:
+                await update.message.reply_text(
+                    "❌ Ссылка должна начинаться с https://\nПопробуйте ещё раз:")
             return
         set_setting(f'{pay_type}_url', link)
         context.user_data['state'] = ''
@@ -1188,7 +1359,7 @@ async def calculate_cost(update_or_query, context):
     total = round(stars * rate, 2)
     context.user_data['total'] = total
     context.user_data['state'] = ''
-    context.user_data['item_title'] = f"Звёзды: {stars}x{rate}₽"
+    context.user_data['item_title'] = f"{stars} ⭐ Telegram Stars ({total:g}₽)"
 
     # Определяем реального покупателя
     user = getattr(update_or_query, 'effective_user', None)
@@ -1245,9 +1416,12 @@ async def calculate_cost(update_or_query, context):
 # === Блок 2: Telegram Premium ===
 async def show_premium_prompt(query, context):
     context.user_data['state'] = 'WAIT_USERNAME_PREMIUM'
-    keyboard = [
-        [InlineKeyboardButton("🔙 Назад", callback_data='back')]
-    ]
+    keyboard = []
+    own_username = getattr(query.from_user, 'username', None) if getattr(query, 'from_user', None) else None
+    if own_username:
+        keyboard.append([InlineKeyboardButton(
+            f"👤 Купить себе (@{own_username})", callback_data='use_my_username_prem')])
+    keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data='back')])
     await query.message.edit_text(
         screen_text('premium_prompt'),
         reply_markup=InlineKeyboardMarkup(keyboard),
@@ -1398,11 +1572,14 @@ async def payment_card(query, context):
 async def payment_crypto(query, context):
     total = context.user_data.get('total', 0)
     order_id = context.user_data.get('order_id', 0)
-    url = build_payment_url(get_payment_url('crypto_url', CRYPTO_PAYMENT_URL), order_id, total)
+    base = get_payment_url('crypto_url', CRYPTO_PAYMENT_URL)
+    url = build_payment_url(base, order_id, total, comment=f"Order #{order_id}")
     logger.info("Оплата криптовалютой: заказ=%s, сумма=%s₽, ссылка=%s", order_id, total, url)
+    label = "💎 Оплатить в Tonkeeper" if (is_ton_address(base.strip()) or 'tonkeeper' in base.lower()) \
+        else f"💳 Перейти на страницу оплаты ({total:g}₽)"
 
     keyboard = [
-        [InlineKeyboardButton(f"💳 Перейти на страницу оплаты ({total}₽)", url=url)],
+        [InlineKeyboardButton(label, url=url)],
         [InlineKeyboardButton("✅ Я оплатил", callback_data=f"paid_{order_id}")],
         [InlineKeyboardButton("🔙 Назад", callback_data='payment')]
     ]
@@ -2374,10 +2551,18 @@ async def admin_setpay(query, context, pay_type):
     current = get_payment_url(key, '')
     logger.info("Админ %s выбрал изменение ссылки %s", query.from_user.id, key)
 
+    if pay_type == 'crypto':
+        hint = ("Отправьте ссылку <code>https://…</code> или просто адрес TON-кошелька\n"
+                "(<code>UQ…</code> / <code>EQ…</code>, 48 символов) — бот сам сделает кнопку оплаты в Tonkeeper.")
+    else:
+        hint = ("Подойдёт ссылка ЮMoney (<code>https://yoomoney.ru/to/…</code>) — сумма заказа "
+                "подставится сама. Либо касса Platega/Lava/AAIO/CloudTips: отправьте ссылку "
+                "<code>https://…</code> (к ней добавятся order_id и amount).")
+
     await query.edit_message_text(
         f"{emoji} <b>Новая ссылка для «{title}»</b>\n\n"
         f"Сейчас: <code>{html.escape(current or '— не задана —')}</code>\n\n"
-        "Отправьте в чат новую ссылку (начинающуюся с https://):",
+        f"{hint}",
         reply_markup=InlineKeyboardMarkup([[
             InlineKeyboardButton("🔙 К ссылкам оплаты", callback_data='adm_pay_links')
         ]]),
@@ -2682,7 +2867,7 @@ async def back_to_menu(query, context):
 
 
 # === HealthCheck HTTP-сервер (для 24/7 бесплатного облачного хостинга) ===
-BOT_VERSION = "2026-10-28.5"
+BOT_VERSION = "2026-10-28.6"
 
 
 class HealthCheckHandler(BaseHTTPRequestHandler):
@@ -2703,6 +2888,17 @@ def start_health_server():
     server.serve_forever()
 
 
+async def _post_init(app):
+    """Узнаём @username бота, чтобы запретить заказ на самого себя."""
+    global BOT_USERNAME
+    try:
+        me = await app.bot.get_me()
+        BOT_USERNAME = (me.username or '').strip()
+        logger.info("Бот: @%s (id=%s)", BOT_USERNAME, me.id)
+    except Exception as exc:
+        logger.warning("Не удалось получить username бота: %s", exc)
+
+
 # === Main ===
 def main():
     init_db()
@@ -2715,7 +2911,7 @@ def main():
     threading.Thread(target=start_health_server, daemon=True).start()
     start_self_ping_loop()
 
-    app = Application.builder().token(TOKEN).build()
+    app = Application.builder().token(TOKEN).post_init(_post_init).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("admin", admin_panel))
