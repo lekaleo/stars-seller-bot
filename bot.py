@@ -72,6 +72,7 @@ MAX_STARS = 50000
 RATE_LIMIT_SECONDS = 1.0  # анти-флуд: не чаще одного действия в секунду
 
 REVIEWS_LINK = "https://t.me/starsdefolt"
+SUPPORT_LINK = os.getenv("SUPPORT_LINK", "https://t.me/starsdefoltsupport")
 
 USERNAME_RE = re.compile(r"^@[a-zA-Z][a-zA-Z0-9_]{4,31}$")
 
@@ -171,6 +172,9 @@ TEXT_DEFAULTS = {
                       '<tg-emoji emoji-id="5811989245761426317">💰</tg-emoji> Стоимость: {total}₽'),
     'reviews_text': ('<tg-emoji emoji-id="5884510167986343350">💬</tg-emoji><b> Отзывы покупателей </b>\n'
                      '<blockquote>Нажмите кнопку ниже, чтобы перейти на наш канал с отзывами: @starsdefolt</blockquote>'),
+    'support_text': ('<tg-emoji emoji-id="5884510167986343350">🛠</tg-emoji> <b>Техподдержка </b>\n'
+                     '<blockquote>Возник вопрос по заказу, оплате или начислению звёзд?\n'
+                     'Напишите нам в поддержку: @starsdefoltsupport — отвечаем быстро!</blockquote>'),
     'payment_menu': ('<tg-emoji emoji-id="5927169041595634481">💳</tg-emoji> <b>Оплата </b>\n\n'
                      '<tg-emoji emoji-id="5967548335542767952">💳</tg-emoji> Заказ #{order_id}\n'
                      '<tg-emoji emoji-id="5985472565508838112">🎁</tg-emoji> {item_title} \n'
@@ -196,6 +200,7 @@ SCREEN_VARS = {
     'premium_tariffs': '{recipient}',
     'premium_order': '{order_id}, {recipient}, {months}, {total}',
     'reviews_text': '(без переменных)',
+    'support_text': '(без переменных)',
     'payment_menu': '{order_id}, {item_title}, {total}',
     'payment_sbp_text': '{total}',
     'payment_card_text': '{total}',
@@ -213,6 +218,7 @@ SCREEN_TITLES = {
     'premium_tariffs': '💎 Premium: выбор тарифа',
     'premium_order': '💎 Premium: карточка заказа',
     'reviews_text': '⭐ Отзывы: пост раздела',
+    'support_text': '🛠 Техподдержка: пост раздела',
     'payment_menu': '💳 Оплата: выбор способа',
     'payment_sbp_text': '💳 Оплата: СБП',
     'payment_card_text': '💳 Оплата: Карта РФ',
@@ -337,6 +343,8 @@ BUTTON_DEFAULTS = {
     'btn_pay_card': "💳 Банковская карта (РФ)",
     'btn_pay_crypto': "💎 Криптовалюта (USDT / TON / BTC)",
     'btn_reviews_url': "📢 Перейти к отзывам",
+    'btn_main_support': "🛠 Техподдержка",
+    'btn_support_url': "💬 Написать в поддержку",
 }
 
 # Премиум-иконки кнопок (рисуются нативно через icon_custom_emoji_id)
@@ -360,6 +368,8 @@ BUTTON_TITLES = {
     'btn_pay_card': 'Кнопка способа оплаты: Карта РФ',
     'btn_pay_crypto': 'Кнопка способа оплаты: Крипта',
     'btn_reviews_url': 'Кнопка перехода в канал отзывов',
+    'btn_main_support': '4-й блок главного меню (Техподдержка)',
+    'btn_support_url': 'Кнопка перехода в поддержку',
 }
 
 BUTTON_VARS = {
@@ -478,7 +488,8 @@ def main_keyboard():
     return [
         [make_btn('btn_main_stars', callback_data='catalog_stars')],
         [make_btn('btn_main_premium', callback_data='catalog_premium')],
-        [make_btn('btn_main_reviews', callback_data='reviews')]
+        [make_btn('btn_main_reviews', callback_data='reviews')],
+        [make_btn('btn_main_support', callback_data='support')]
     ]
 
 
@@ -883,6 +894,7 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         'catalog': show_catalog_prompt,  # совместимость со старыми меню
         'catalog_premium': show_premium_prompt,
         'reviews': show_reviews,
+        'support': show_support,
         'payment': show_payment,
         'back': back_to_menu,
         'stars_100': lambda q, c: select_stars(q, c, 100),
@@ -1506,6 +1518,16 @@ async def show_reviews(query, context):
     await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
 
 
+# === Блок 5: Техподдержка ===
+async def show_support(query, context):
+    text = screen_text('support_text')
+    keyboard = [
+        [make_btn('btn_support_url', url=SUPPORT_LINK)],
+        [InlineKeyboardButton("🔙 Назад", callback_data='back')]
+    ]
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+
+
 # === Блок 4: Оплата (только внутри оформленного заказа) ===
 async def show_payment(query, context):
     total = context.user_data.get('total')
@@ -1546,6 +1568,7 @@ async def payment_sbp(query, context):
     keyboard = [
         [InlineKeyboardButton(f"💳 Перейти на страницу оплаты ({total}₽)", url=url)],
         [InlineKeyboardButton("✅ Я оплатил", callback_data=f"paid_{order_id}")],
+        [make_btn('btn_support_url', url=SUPPORT_LINK)],
         [InlineKeyboardButton("🔙 Назад", callback_data='payment')]
     ]
     await query.edit_message_text(
@@ -1562,6 +1585,7 @@ async def payment_card(query, context):
     keyboard = [
         [InlineKeyboardButton(f"💳 Перейти на страницу оплаты ({total}₽)", url=url)],
         [InlineKeyboardButton("✅ Я оплатил", callback_data=f"paid_{order_id}")],
+        [make_btn('btn_support_url', url=SUPPORT_LINK)],
         [InlineKeyboardButton("🔙 Назад", callback_data='payment')]
     ]
     await query.edit_message_text(
@@ -1581,6 +1605,7 @@ async def payment_crypto(query, context):
     keyboard = [
         [InlineKeyboardButton(label, url=url)],
         [InlineKeyboardButton("✅ Я оплатил", callback_data=f"paid_{order_id}")],
+        [make_btn('btn_support_url', url=SUPPORT_LINK)],
         [InlineKeyboardButton("🔙 Назад", callback_data='payment')]
     ]
     await query.edit_message_text(
@@ -1686,8 +1711,13 @@ async def customer_paid(query, context, order_id):
     set_order_status(order_id, 'waiting_check')
     logger.info("Заказ #%s отправлен на проверку (waiting_check)", order_id)
 
+    support_kb = InlineKeyboardMarkup([
+        [make_btn('btn_support_url', url=SUPPORT_LINK)],
+        [InlineKeyboardButton("🔙 В меню", callback_data='back')]
+    ])
     await query.edit_message_text(
         screen_text('paid_wait_text', order_id=order_id),
+        reply_markup=support_kb,
         parse_mode='HTML'
     )
 
@@ -2867,7 +2897,7 @@ async def back_to_menu(query, context):
 
 
 # === HealthCheck HTTP-сервер (для 24/7 бесплатного облачного хостинга) ===
-BOT_VERSION = "2026-10-28.6"
+BOT_VERSION = "2026-10-28.7"
 
 
 class HealthCheckHandler(BaseHTTPRequestHandler):
